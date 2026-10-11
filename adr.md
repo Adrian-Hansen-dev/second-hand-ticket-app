@@ -25,6 +25,8 @@ Status: `offen` · `akzeptiert` · `ersetzt durch ADR-xxx`.
 | ADR-011 | Brute-Force-Schutz im API Gateway | akzeptiert | Step 1 (`login`) |
 | ADR-012 | Unzureichendes Guthaben bei Kaufabschluss | offen | Step 3 (`acceptOffer`) |
 | ADR-013 | Ablauf der Ticketgültigkeit bei reserviertem Kauf | offen | Step 3 (`expireTicketOffer`) |
+| ADR-014 | Berechtigungsprüfung über die Identität aus dem Login | akzeptiert | Step 2 |
+| ADR-015 | Ticket Management in eigenem Ticket Service | akzeptiert | Step 3 (`createTicketOffer`) |
 
 ---
 
@@ -170,6 +172,28 @@ Status: `offen` · `akzeptiert` · `ersetzt durch ADR-xxx`.
 | Alternativen | **A) Automatische Rückbuchung an den Käufer.** Gewinnt bei Käuferschutz und Einfachheit. Schwäche: Verkäufer verliert Geld, wenn der Käufer das Ticket erhalten, aber nicht bestätigt hat. **B) Automatische Freigabe an den Verkäufer** nach einer Karenzfrist. Gewinnt beim Verkäuferschutz, kein Geld bleibt hängen. Schwäche: Käufer ohne Ticket verliert Geld. **C) Fall wird dem Admin vorgelegt** (nutzt `requestTicketReceivalStatus()`). Gewinnt bei Fairness. Schwäche: Admin-Engpass, langsam. |
 | Konsequenzen | _offen_ – betrifft Ticket, Purchase und Balance, vermutlich Saga |
 | Treiber | Robustheit, Security |
+
+## ADR-014 – Berechtigungsprüfung über die Identität aus dem Login
+
+| Feld | Inhalt |
+| --- | --- |
+| Status | akzeptiert |
+| Kontext | Viele Operationen „lesen" `User` nur, um Identität oder Rolle des Aufrufers zu prüfen (`createTicketOffer`, `sendMessage`, `requestWithdrawl`, `updateBalance` u. a.). Zählt dieser Lesezugriff als Subdomäne, wird fast jede Operation subdomänenübergreifend und hängt zur Laufzeit von IAM ab. |
+| Entscheidung | `login()` stellt eine Identität aus (UserId, Rolle, Status). Das API Gateway prüft sie bei jeder Anfrage und reicht sie an die Services weiter. Berechtigungsprüfungen nutzen diese Identität und lesen das `User`-Aggregate nicht. Wo fachliche Benutzerdaten gebraucht werden (z. B. IBAN, Kundennummer), bleibt der Lesezugriff bestehen. |
+| Alternativen | **A) `User` bei jeder Prüfung synchron lesen.** Gewinnt bei Aktualität: eine Sperre oder Rollenänderung wirkt sofort. Nicht gewählt, weil IAM damit auf jedem kritischen Pfad liegt und ein IAM-Ausfall die ganze Plattform blockiert (Verfügbarkeit). **B) Lokale Kopie der Benutzerdaten in jedem Service, aktualisiert per Event.** Gewinnt bei Aktualität ohne Laufzeitkopplung. Nicht gewählt, weil jeder Service zusätzliche Replik und Event-Handler bräuchte. |
+| Konsequenzen | (+) Sechs Operationen bleiben lokal, darunter `createTicketOffer()` und `sendMessage()`. (+) IAM liegt nur bei `login()` und `register()` auf dem kritischen Pfad. (−) Eine Sperre durch `blockUser()` wirkt erst, wenn die ausgestellte Identität abläuft oder widerrufen wird; das wird bei `blockUser()` gelöst. (−) Rollenänderungen greifen erst nach erneutem Login. |
+| Treiber | Verfügbarkeit, Security |
+
+## ADR-015 – Ticket Management in eigenem Ticket Service
+
+| Feld | Inhalt |
+| --- | --- |
+| Status | akzeptiert |
+| Kontext | Erste Iteration von Schritt 3 (`createTicketOffer()`, Rang 1); die Architektur ist leer. Die Operation schreibt nur `TicketOffer` (Ticket Management); IAM wird laut ADR-014 nur über die Identität aus dem Login genutzt. Offen ist, ob der Benutzerstatus (gesperrt) zusätzlich geprüft wird. |
+| Entscheidung | Ticket Management wird einem neuen **Ticket Service** zugewiesen. `createTicketOffer()` ist lokal; das API Gateway prüft die Identität und leitet weiter. |
+| Alternativen | **A) Benutzerstatus synchron bei IAM prüfen.** Gewinnt bei Security: eine Sperre wirkt sofort. Nicht gewählt, weil ein IAM-Ausfall das Anlegen von Angeboten blockiert (Verfügbarkeit, Rang 1) und ADR-014 widerspricht. **B) Lokale Kopie gesperrter Benutzer im Ticket Service, aktualisiert über ein Event `UserBlocked`.** Gewinnt bei Security ohne Laufzeitkopplung. Vorerst nicht gewählt, weil die Sperre alle Services betrifft und einheitlich bei `blockUser()` entschieden werden soll. |
+| Konsequenzen | (+) Einfachster Service, keine Laufzeitkopplung, die hohe Leselast der Suche ist von IAM getrennt. (+) Team Marktplatz kann unabhängig liefern (Teamzuschnitt siehe Schritt 2). (−) Ein gesperrter Benutzer kann bis zum Ablauf seiner Anmeldung noch Angebote anlegen. (−) Ob Purchase Management später in denselben Service kommt, ist offen (Entscheidung bei `expressPurchaseInterest()`). |
+| Treiber | Verfügbarkeit, Usability |
 
 ---
 

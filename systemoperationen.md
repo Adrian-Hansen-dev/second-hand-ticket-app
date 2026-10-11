@@ -9,7 +9,7 @@ Diese Spezifikation beschreibt die Systemoperationen nach dem Assemblage-Ansatz.
 | `User` | Benutzerkonto und Benutzerstatus | UserId, Benutzername, Vorname, Nachname, Geburtsdatum, E-Mail, Kundennummer (Betreff für Einzahlungen), IBAN, Credentials, Rolle (User / Admin / Accounting), Status |
 | `TicketOffer` | Zum Verkauf angebotenes Ticket | TicketId, SellerId, Start, End, ValidFrom, ValidUntil, Provider, Price, OriginalPrice, Status |
 | `Purchase` | Kaufvorgang zwischen Käufer und Verkäufer | PurchaseId, TicketId, BuyerId, SellerId, AgreedPrice, BuyerAccepted, SellerAccepted, Status |
-| `Conversation` | Kommunikation zwischen Käufer und Verkäufer | ConversationId, Participants, Messages |
+| `Conversation` | Kommunikation zwischen Käufer und Verkäufer (bei Admin-Nachfrage auch Admin) | ConversationId, Participants, Messages |
 | `BalanceAccount` | Guthabenkonto eines Benutzers | UserId, AvailableBalance, ReservedBalance, Transactions |
 | `Withdrawal` | Auszahlungsanforderung | WithdrawalId, UserId, Amount, Status |
 | `Cancellation` | Stornoantrag eines Käufers | CancellationId, PurchaseId, Reason, SellerResponse, Status, Deadline |
@@ -412,8 +412,9 @@ stateDiagram-v2
 **Verhalten**
 
 - Liest: `Purchase`, `User`.
-- Schreibt: gegebenenfalls `Conversation` oder einen Supportvorgang.
+- Schreibt: `Conversation`.
 - Prüft, dass der Kauf noch nicht abgeschlossen ist, und fordert beim Verkäufer eine Auskunft zur Ticketübergabe an.
+- Die Anfrage wird als Nachricht des Admins der bestehenden `Conversation` des Kaufs hinzugefügt; existiert keine, wird sie angelegt. Der Admin wird dabei Teilnehmer.
 
 **Nichtfunktionale Anforderungen**
 
@@ -707,7 +708,7 @@ Reihenfolge für Schritt 3: Operationen mit hohem Geschäftswert oder hohem tech
 | 2 | `searchTicket()` | 2 | V · U | Meistgenutzte Operation; ihre Verfügbarkeit entscheidet über die Akzeptanz. |
 | 3 | `expressPurchaseInterest()` | 3 | V · U | Startet den Kauf; erste subdomänenübergreifende Operation (Ticket, Purchase, Communication). |
 | 4 | `acceptOffer()` | 4 | R · S | Höchstes technisches Risiko: Geld und Ticket konsistent, kein Doppelverkauf. |
-| 5 | `confirmTicketReceival()` | 11 | R · S | ⚠ Vorgezogen: schließt den Kernablauf ab und gibt Geld frei; gleiche Subdomänen wie `acceptOffer()`, daher gemeinsam entscheiden. |
+| 5 | `confirmTicketReceival()` | 11 | R · S | Vorgezogen (vom Team bestätigt): schließt den Kernablauf ab und gibt Geld frei; gleiche Subdomänen wie `acceptOffer()`, daher gemeinsam entscheiden. |
 | 6 | `register()` | 5 | U · S | Voraussetzung für alle Aktionen; fachlich einfach, initialisiert aber das Guthabenkonto. |
 | 7 | `login()` | 6 | S · V | Voraussetzung für alle Aktionen; Standardfunktionalität, lokal. |
 | 8 | `sendMessage()` | 7 | U · V | Preis- und Übergabeverhandlung; Usability gegenüber der Konkurrenz. |
@@ -732,7 +733,7 @@ Reihenfolge für Schritt 3: Operationen mit hohem Geschäftswert oder hohem tech
 
 Abgeleitet aus „Liest/Schreibt". Legende: **S** = schreibt (und liest), **L** = liest, **(L)** = liest `User` nur zur Berechtigungs- oder Identitätsprüfung, **(S)** = schreibt nur bei automatischer Stornierung (ADR-005), **E** = publiziert ein Event, das Notification verarbeitet (asynchron, ADR-010).
 
-⚠ Annahme: Berechtigungsprüfungen (L) nutzen die beim Login ausgestellte Identität und zählen nicht als eigene Subdomäne. Ob das trägt, entscheidet Schritt 3.
+Berechtigungsprüfungen (L) nutzen die beim Login ausgestellte Identität und zählen nicht als eigene Subdomäne (→ ADR-014).
 
 | Rang | Operation | IAM | Ticket | Purchase | Comm. | Balance | Cancel. | Rating | Notif. | Subdomänen | Einstufung |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -752,7 +753,7 @@ Abgeleitet aus „Liest/Schreibt". Legende: **S** = schreibt (und liest), **L** 
 | 14 | `expireCancellationDeadline()` | | (S) | L (S) | | (S) | S | | | 2–4 | übergreifend |
 | 15 | `requestTicketRelisting()` | | S | S | | S | S | | | 4 | übergreifend |
 | 16 | `approveCancellation()` | | S | S | | S | S | | E | 4 | übergreifend |
-| 17 | `requestTicketReceivalStatus()` | L | | L | S ⚠ | | | | | 3 | übergreifend |
+| 17 | `requestTicketReceivalStatus()` | L | | L | S | | | | | 3 | übergreifend |
 | 18 | `blockUser()` | S | | | | | L | | | 2 | übergreifend |
 | 19 | `withdrawTicketOffer()` | | S | S | | | | | E | 2 | übergreifend |
 | 20 | `updateTicketOffer()` | | S | | | | | | | 1 | lokal |
@@ -767,7 +768,7 @@ Abgeleitet aus „Liest/Schreibt". Legende: **S** = schreibt (und liest), **L** 
 | 29 | `viewPendingWithdrawals()` | L | | | | L | | | | 2 | übergreifend |
 | 30 | `findUserByCustomerNumber()` | L | | | | | | | | 1 | lokal |
 
-⚠ Bei `requestTicketReceivalStatus()` schreiben die Teamnotizen `Conversation` (Admin nutzt `sendMessage()`); die Spezifikation lässt „`Conversation` oder einen Supportvorgang" offen.
+`requestTicketReceivalStatus()` schreibt in die `Conversation` des Kaufs (Teamentscheidung, siehe Offene Architekturentscheidungen).
 
 **Ergebnis:** 17 von 30 Operationen sind subdomänenübergreifend (14 Kommandos, 3 Abfragen). Sie werden in Schritt 3 verteilt, sobald ihre Subdomänen in verschiedenen Services liegen, und brauchen dann ein Kollaborationsmuster (Saga, API Composition, CQRS). Kritisch sind `acceptOffer()`, `confirmTicketReceival()`, `requestTicketRelisting()` und `approveCancellation()`: Sie schreiben drei bis vier Subdomänen, darunter Balance.
 
@@ -785,6 +786,103 @@ Abgeleitet aus „Liest/Schreibt". Legende: **S** = schreibt (und liest), **L** 
 | Cancellation Management | mittel–hoch (Fristen, Streitfälle, Rückbuchung) | Interaktion | Zuverlässige Fristüberwachung | Selten genutzt, aber geldkritisch |
 | User Rating | niedrig | Interaktion | Einfache Speicherung, leseoptimierte Abfrage | Leselastig; unkritisch für den Kauf |
 | Notification | niedrig–mittel (mehrere Kanäle) | Plattform | Asynchrone Verarbeitung, Wiederholversuche | Darf ausfallen, ohne den Kernablauf zu blockieren (ADR-010) |
+
+## Services und Kollaborationen (Assemblage Schritt 3)
+
+Die Architektur startet leer. Operationen werden in der Reihenfolge des Rankings realisiert; je Operation werden nur ihre noch nicht zugewiesenen Subdomänen platziert. Die Architektur ist technologieneutral.
+
+**Fortschritt**
+
+- [x] 1 `createTicketOffer()` – ADR-015
+- [ ] 2 `searchTicket()`
+- [ ] 3 `expressPurchaseInterest()`
+- [ ] 4 `acceptOffer()`
+- [ ] 5 `confirmTicketReceival()`
+- [ ] 6 `register()`
+- [ ] 7 `login()`
+- [ ] 8 `sendMessage()`
+- [ ] 9 `updateBalance()`
+- [ ] 10 `requestWithdrawl()`
+- [ ] 11 `viewBalance()`
+- [ ] 12 `requestPurchaseCancellation()`
+- [ ] 13 `respondToCancellation()`
+- [ ] 14 `expireCancellationDeadline()`
+- [ ] 15 `requestTicketRelisting()`
+- [ ] 16 `approveCancellation()`
+- [ ] 17 `requestTicketReceivalStatus()`
+- [ ] 18 `blockUser()`
+- [ ] 19 `withdrawTicketOffer()`
+- [ ] 20 `updateTicketOffer()`
+- [ ] 21 `expireTicketOffer()`
+- [ ] 22 `rateUser()`
+- [ ] 23 `viewUserRatings()`
+- [ ] 24–30 Ergänzte Abfragen
+
+### Realisierung: `createTicketOffer()` (Rang 1)
+
+**Subdomänen:** Ticket Management (neu zuzuweisen). IAM wird nur zur Berechtigungsprüfung gelesen und ist laut ADR-014 keine Subdomäne der Operation.
+
+**Kandidaten**
+
+| # | Zuweisung | lokal/verteilt | Kollaboration |
+| --- | --- | --- | --- |
+| 1 | Ticket Management → neuer **Ticket Service** | lokal | API Gateway prüft die Identität aus dem Login (ADR-014) und leitet weiter. |
+| 2 | Ticket Management → neuer Ticket Service; Benutzerstatus wird live geprüft | verteilt | Ticket Service ruft IAM synchron auf („Ist der Benutzer gesperrt?"), bevor das Angebot angelegt wird. |
+| 3 | Ticket Management → neuer Ticket Service mit lokaler Kopie des Benutzerstatus | lokal zur Laufzeit | Ticket Service hält gesperrte Benutzer als Replik; IAM publiziert ein Event `UserBlocked`, das der Ticket Service behandelt. |
+
+**Bewertung**
+
+| Kraft | #1 | #2 | #3 |
+| --- | --- | --- | --- |
+| Simple components | ✅ nur Angebotslogik | ✅ nur Angebotslogik | ⚠ zusätzliche Replik und Event-Handler |
+| Team autonomy | ✅ Team Marktplatz allein | ⚠ abhängig von der IAM-Schnittstelle | ⚠ abhängig vom IAM-Event |
+| Fast deployment pipeline | ✅ kleiner Service | ✅ kleiner Service | ✅ kleiner Service |
+| Support multiple technology stacks | ✅ leseoptimierte Suche frei wählbar | ✅ gleich | ✅ gleich |
+| Segregate by characteristics | ✅ hohe Leselast getrennt von IAM | ✅ gleich | ✅ gleich |
+| Simple interactions | ✅ keine | ⚠ ein synchroner Aufruf | ⚠ eine Event-Subscription |
+| Efficient interactions | ✅ keine Zusatzaufrufe | ⚠ zusätzlicher Aufruf pro Angebot | ✅ keine Zusatzaufrufe |
+| Prefer ACID over BASE | ✅ ein Aggregate, eine Transaktion | ✅ gleich | ⚠ Benutzerstatus eventual consistent |
+| Minimize runtime coupling | ✅ keine | ❌ IAM-Ausfall blockiert Angebote | ✅ keine |
+| Minimize design-time coupling | ✅ nur Identität aus dem Login | ⚠ IAM-Schnittstelle | ⚠ IAM-Event-Schema |
+| Treiber: Verfügbarkeit | ✅ | ❌ | ✅ |
+| Treiber: Security | ⚠ gesperrter Benutzer kann bis zum Ablauf seiner Anmeldung anbieten | ✅ Sperre wirkt sofort | ✅ Sperre wirkt nahezu sofort |
+
+**Entscheidung:** Kandidat #1 (→ ADR-015). Er ist am einfachsten, hat keine Laufzeitkopplung und gewinnt beim wichtigsten Treiber Verfügbarkeit. Die Security-Lücke bei gesperrten Benutzern betrifft alle Operationen gleich und wird bei `blockUser()` (Rang 18) gelöst; Kandidat #3 bleibt dort eine Option.
+
+**Änderungen an der Architektur:** API Gateway: Route `createTicketOffer()` → Ticket Service · Ticket Service: neu, Subdomäne Ticket Management, persistentes Aggregate `TicketOffer`
+
+```mermaid
+sequenceDiagram
+    actor Verkäufer
+    participant Gateway as API Gateway
+    participant TicketService as Ticket Service
+
+    Verkäufer->>Gateway: createTicketOffer(start, end, ..., price, originalPrice)
+    Gateway->>Gateway: Identität aus dem Login prüfen
+    Gateway->>TicketService: createTicketOffer(sellerId, ...)
+    TicketService->>TicketService: Daten validieren, TicketOffer im Status Available speichern
+    TicketService-->>Gateway: TicketId
+    Gateway-->>Verkäufer: TicketId
+```
+
+## Service-Architektur (aktueller Stand)
+
+**API Gateway** – authentifiziert Anfragen über die Identität aus dem Login (ADR-014), drosselt Fehlversuche beim Login (ADR-011) und leitet weiter.
+
+| Operation | Ziel-Service |
+| --- | --- |
+| `createTicketOffer()` | Ticket Service |
+
+**Ticket Service**
+
+| Feld | Inhalt |
+| --- | --- |
+| Subdomänen | Ticket Management |
+| Persistente Aggregates | `TicketOffer` («persistent») |
+| Angebotene Operationen | `createTicketOffer()` |
+| Publizierte Events | – |
+| Behandelte Events | – |
+| Aufrufer | Verkäufer (User) über API Gateway |
 
 ## Offene Architekturentscheidungen
 
@@ -804,9 +902,9 @@ Abgeleitet aus „Liest/Schreibt". Legende: **S** = schreibt (und liest), **L** 
 | Statusmodelle | Sind die ergänzten Statuswerte (`Sold`, `Withdrawn`, `Expired`, `SellerConfirmed`, `Disputed`, `Requested`) und Übergänge korrekt? |
 | Benachrichtigungen | → ADR-010 |
 | Login | → ADR-011 |
-| Ranking | Ist das Vorziehen von `confirmTicketReceival()` von Rang 11 auf Rang 5 akzeptiert? |
-| Berechtigungsprüfung | Reicht die beim Login ausgestellte Identität für Berechtigungsprüfungen, oder müssen Operationen das `User`-Aggregate lesen? |
-| Admin-Nachfrage | Schreibt `requestTicketReceivalStatus()` in die `Conversation` (Teamnotizen) oder einen eigenen Supportvorgang (Spezifikation)? |
-| Subdomänen-Charakteristika | Sind Komplexität, Teamzuschnitt (Plattform, Marktplatz, Zahlungen, Interaktion) und technische Anforderungen so zutreffend? |
+| Ranking | ✔ Entschieden (Team): `confirmTicketReceival()` bleibt auf Rang 5. |
+| Berechtigungsprüfung | → ADR-014 |
+| Admin-Nachfrage | ✔ Entschieden (Team): `requestTicketReceivalStatus()` schreibt in die `Conversation` des Kaufs und legt sie bei Bedarf an. |
+| Subdomänen-Charakteristika | ✔ Entschieden (Team): Teamzuschnitt Plattform, Marktplatz, Zahlungen, Interaktion bestätigt; bleibt gegenüber dem Brief eine Annahme. |
 
 Besonders für Auszahlungen muss das Auflösen einer zuvor angelegten Reservierung definiert werden. Andernfalls besteht das Risiko, dass bei einer späteren negativen `updateBalance()`-Buchung derselbe Betrag doppelt abgezogen wird.
