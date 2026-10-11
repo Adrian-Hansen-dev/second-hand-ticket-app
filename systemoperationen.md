@@ -369,13 +369,19 @@ sequenceDiagram
     participant App as Ticket-App
     participant Purchase as Purchase
     participant Ticket as TicketOffer
+    participant Chat as Conversation
     participant Balance as BalanceAccount
 
     Käufer->>App: expressPurchaseInterest(ticketId)
     App->>Ticket: Verfügbarkeit prüfen
     Ticket-->>App: Ticket verfügbar
-    App->>Purchase: Kauf mit Status Pending anlegen
+    App->>Purchase: Kauf anlegen
+    App->>Purchase: Status auf Pending setzen
+    App->>Chat: Chat für Käufer und Verkäufer anlegen
     App-->>Verkäufer: Kaufinteresse benachrichtigen
+
+    Käufer->>Chat: Ort, Übergabe und Preis abstimmen
+    Verkäufer->>Chat: Ort, Übergabe und Preis abstimmen
 
     Käufer->>App: acceptOffer(purchaseId)
     App->>Purchase: Käuferzustimmung speichern
