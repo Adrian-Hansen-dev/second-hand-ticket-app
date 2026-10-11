@@ -18,6 +18,32 @@ Diese Spezifikation beschreibt die Systemoperationen nach dem Assemblage-Ansatz.
 
 Aggregates sind fachliche Konsistenzgrenzen; daraus folgt nicht zwangsläufig eine Aufteilung in eigene Microservices.
 
+### Beziehungen der Aggregates
+
+```mermaid
+classDiagram
+    class User
+    class TicketOffer
+    class Purchase
+    class Conversation
+    class BalanceAccount
+    class Withdrawal
+    class Cancellation
+    class RelistingRequest
+    class Rating
+
+    User "1" --> "0..*" TicketOffer : erstellt
+    User "1" --> "0..*" Purchase : kauft
+    TicketOffer "1" --> "0..*" Purchase : Gegenstand
+    Purchase "1" --> "0..1" Conversation : ermöglicht
+    User "1" --> "1" BalanceAccount : besitzt
+    BalanceAccount "1" --> "0..*" Withdrawal : hat
+    Purchase "1" --> "0..1" Cancellation : hat
+    TicketOffer "1" --> "0..*" RelistingRequest : hat
+    Purchase "1" --> "0..*" Rating : Grundlage
+    User "1" --> "0..*" Rating : verfasst
+```
+
 ## User – Registrierung und Authentifizierung
 
 ### `register()`
@@ -330,15 +356,110 @@ Aggregates sind fachliche Konsistenzgrenzen; daraus folgt nicht zwangsläufig ei
 - Hohe Datenkonsistenz und Transaktionssicherheit, keine unzulässigen negativen Guthabenstände.
 - Vollständige Protokollierung; Zugriff ausschließlich für autorisierte Buchhaltungsmitarbeiter.
 
-## Zu erstellende Sequenzdiagramme
+## Sequenzdiagramme
 
-Für die komplexeren Abläufe sollen Sequenzdiagramme folgende Interaktionen darstellen:
+Die folgenden Diagramme konkretisieren die fachlich komplexeren Abläufe. Das Bankensystem ist nur ein externer Beteiligter; eine direkte technische Integration ist nicht Teil der Spezifikation.
 
-1. Kaufabschluss
-2. Stornierungsprozess
-3. Manuelle Guthabenverwaltung
+### Kaufabschluss
 
-Das Bankensystem ist dabei lediglich ein externer Beteiligter; eine direkte technische Bankintegration ist zunächst nicht vorgesehen.
+```mermaid
+sequenceDiagram
+    actor Käufer
+    actor Verkäufer
+    participant App as Ticket-App
+    participant Purchase as Purchase
+    participant Ticket as TicketOffer
+    participant Balance as BalanceAccount
+
+    Käufer->>App: expressPurchaseInterest(ticketId)
+    App->>Ticket: Verfügbarkeit prüfen
+    Ticket-->>App: Ticket verfügbar
+    App->>Purchase: Kauf mit Status Pending anlegen
+    App-->>Verkäufer: Kaufinteresse benachrichtigen
+
+    Käufer->>App: acceptOffer(purchaseId)
+    App->>Purchase: Käuferzustimmung speichern
+    Verkäufer->>App: acceptOffer(purchaseId)
+    App->>Purchase: Verkäuferzustimmung speichern
+    App->>Purchase: Beide Zustimmungen prüfen
+    Purchase-->>App: Zustimmung beider Parteien
+    App->>Balance: Kaufbetrag beim Käufer reservieren
+    App->>Ticket: Status auf Reserved setzen
+    App->>Purchase: Status auf Accepted setzen
+
+    Käufer->>App: confirmTicketReceival(purchaseId)
+    App->>Purchase: Käuferberechtigung prüfen
+    App->>Balance: Reservierung freigeben und Verkäufer gutschreiben
+    App->>Purchase: Status auf Completed setzen
+    App-->>Verkäufer: Kaufabschluss bestätigen
+```
+
+### Stornierungsprozess
+
+```mermaid
+sequenceDiagram
+    actor Käufer
+    actor Verkäufer
+    actor Admin
+    participant App as Ticket-App
+    participant Cancellation as Cancellation
+    participant Purchase as Purchase
+    participant Ticket as TicketOffer
+    participant Balance as BalanceAccount
+
+    Käufer->>App: requestPurchaseCancellation(purchaseId, reason)
+    App->>Purchase: Käufer und Stornierbarkeit prüfen
+    App->>Cancellation: Antrag mit Antwortfrist anlegen
+    App-->>Verkäufer: Stornoantrag benachrichtigen
+
+    Verkäufer->>App: respondToCancellation(cancellationId, confirmed)
+    App->>Cancellation: Antwort speichern
+    alt Verkäufer stimmt zu
+        App-->>Admin: Storno zur Entscheidung vorlegen
+    else Verkäufer widerspricht oder Frist läuft ab
+        App-->>Admin: Streitfall zur Entscheidung vorlegen
+    end
+
+    Admin->>App: approveCancellation(cancellationId, approved)
+    alt Storno genehmigt
+        App->>Cancellation: Status auf Approved setzen
+        App->>Purchase: Status auf Cancelled setzen
+        App->>Balance: Betrag an Käufer zurückbuchen
+        App->>Ticket: Ticket gegebenenfalls wieder freigeben
+        App-->>Käufer: Storno bestätigt
+        App-->>Verkäufer: Storno bestätigt
+    else Storno abgelehnt
+        App->>Cancellation: Status auf Rejected setzen
+        App-->>Käufer: Storno abgelehnt
+    end
+```
+
+### Manuelle Guthabenverwaltung
+
+```mermaid
+sequenceDiagram
+    actor Buchhaltung
+    actor Nutzer
+    participant App as Ticket-App
+    participant Balance as BalanceAccount
+    participant Withdrawal as Withdrawal
+    participant Bank as Bankensystem
+
+    Nutzer->>App: requestWithdrawl(amount)
+    App->>Balance: Verfügbares Guthaben prüfen
+    Balance-->>App: Guthaben ausreichend
+    App->>Balance: Betrag reservieren
+    App->>Withdrawal: Auszahlungsanforderung anlegen
+    App-->>Buchhaltung: Auszahlung zur Bearbeitung bereitstellen
+
+    Buchhaltung->>App: updateBalance(userId, -amount)
+    App->>Balance: Berechtigung und Reservierung prüfen
+    App->>Balance: Reservierung auflösen und Buchung dokumentieren
+    App->>Withdrawal: Status auf Processed setzen
+    App-->>Bank: Auszahlungsauftrag bereitstellen
+    Bank-->>App: Ausführung bestätigt
+    App-->>Nutzer: Auszahlung bestätigt
+```
 
 ## Offene Architekturentscheidungen
 
