@@ -1,0 +1,1 @@
+run 'npm run diagrams' to get all diagrams rerendered after changes.

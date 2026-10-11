@@ -1,0 +1,15 @@
+{
+  "name": "second-hand-ticket-app",
+  "private": true,
+  "description": "Mermaid-Rendering für systemoperationen.md",
+  "scripts": {
+    "prediagrams": "node -e \"require('fs').mkdirSync('diagrams',{recursive:true})\"",
+    "diagrams": "mmdc -i systemoperationen.md -o diagrams/systemoperationen.md -b white"
+  },
+  "devDependencies": {
+    "@mermaid-js/mermaid-cli": "11.4.0"
+  },
+  "allowScripts": {
+    "puppeteer@23.11.1": true
+  }
+}
