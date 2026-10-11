@@ -680,6 +680,112 @@ sequenceDiagram
     App-->>Nutzer: Einzahlung gutgeschrieben
 ```
 
+## Subdomänen (Assemblage Schritt 2)
+
+Quelle: Teamnotizen; `Notification` aus ADR-010. Eine Subdomäne besteht aus den Aggregates, auf die ihre Operationen wirken. Die Subdomänen einer Operation sind die Subdomänen aller Aggregates, die sie liest oder schreibt.
+
+### Aggregate → Subdomäne
+
+| Subdomäne | Aggregates |
+| --- | --- |
+| Identity & Access Management (IAM) | `User` |
+| Ticket Management | `TicketOffer` |
+| Purchase Management | `Purchase` |
+| Communication Management | `Conversation` |
+| Balance Management | `BalanceAccount`, `Withdrawal` |
+| Cancellation Management | `Cancellation`, `RelistingRequest` |
+| User Rating | `Rating` |
+| Notification | `Notification` |
+
+### Ranking der Systemoperationen
+
+Reihenfolge für Schritt 3: Operationen mit hohem Geschäftswert oder hohem technischem Risiko zuerst, weil frühe Operationen die Servicegrenzen prägen. „Team" ist der Rang aus den Teamnotizen; neue Operationen sind mit „neu" markiert.
+
+| Rang | Operation | Team | Treiber | Begründung |
+| --- | --- | --- | --- | --- |
+| 1 | `createTicketOffer()` | 1 | U · V | Ohne Angebote kein Marktplatz; Einstieg in den Kernablauf. |
+| 2 | `searchTicket()` | 2 | V · U | Meistgenutzte Operation; ihre Verfügbarkeit entscheidet über die Akzeptanz. |
+| 3 | `expressPurchaseInterest()` | 3 | V · U | Startet den Kauf; erste subdomänenübergreifende Operation (Ticket, Purchase, Communication). |
+| 4 | `acceptOffer()` | 4 | R · S | Höchstes technisches Risiko: Geld und Ticket konsistent, kein Doppelverkauf. |
+| 5 | `confirmTicketReceival()` | 11 | R · S | ⚠ Vorgezogen: schließt den Kernablauf ab und gibt Geld frei; gleiche Subdomänen wie `acceptOffer()`, daher gemeinsam entscheiden. |
+| 6 | `register()` | 5 | U · S | Voraussetzung für alle Aktionen; fachlich einfach, initialisiert aber das Guthabenkonto. |
+| 7 | `login()` | 6 | S · V | Voraussetzung für alle Aktionen; Standardfunktionalität, lokal. |
+| 8 | `sendMessage()` | 7 | U · V | Preis- und Übergabeverhandlung; Usability gegenüber der Konkurrenz. |
+| 9 | `updateBalance()` | 8 | S · R | Einziger Weg, wie Geld ins System kommt (Einzahlung). |
+| 10 | `requestWithdrawl()` | 9 | S · R | Geld verlässt die Plattform; Vertrauen der Kunden. |
+| 11 | `viewBalance()` | 10 | U · S | Häufige Abfrage, Usability. |
+| 12 | `requestPurchaseCancellation()` | 12 | U · R | Käuferschutz; startet den Stornoprozess. |
+| 13 | `respondToCancellation()` | 13 | U · R | Verkäuferseite des Stornoprozesses. |
+| 14 | `expireCancellationDeadline()` | neu | R · U | Im Brief verlangte Regel „für den Käufer entscheiden"; zeitgesteuert, eigenes Risiko. |
+| 15 | `requestTicketRelisting()` | 14 | R · S | Berührt vier Subdomänen inkl. Rückbuchung; hohes Konsistenzrisiko, aber seltener Fall. |
+| 16 | `approveCancellation()` | 15 | R · S | Streitfall mit Rückbuchung; selten, berührt vier Subdomänen. |
+| 17 | `requestTicketReceivalStatus()` | neu | R · U | Admin-Unterstützung im Streitfall; geringes Risiko. |
+| 18 | `blockUser()` | 16 | S | Missbrauchsschutz; selten, lokal in IAM. |
+| 19 | `withdrawTicketOffer()` | neu | U | Komfort für Verkäufer; geringes Risiko. |
+| 20 | `updateTicketOffer()` | neu | U | Komfort für Verkäufer; lokal. |
+| 21 | `expireTicketOffer()` | neu | R · U | Bereinigung abgelaufener Angebote; die Suche filtert ohnehin nach Gültigkeit. |
+| 22 | `rateUser()` | 17 | R · S | Vertrauen in der Community; nicht Teil des Geldflusses. |
+| 23 | `viewUserRatings()` | 18 | U · V | Reine Leseoperation, lokal. |
+| 24–30 | Ergänzte Abfragen | neu | U | Reine Leseoperationen; werden nach den Kommandos zugeordnet. |
+
+### Operation × Subdomäne
+
+Abgeleitet aus „Liest/Schreibt". Legende: **S** = schreibt (und liest), **L** = liest, **(L)** = liest `User` nur zur Berechtigungs- oder Identitätsprüfung, **(S)** = schreibt nur bei automatischer Stornierung (ADR-005), **E** = publiziert ein Event, das Notification verarbeitet (asynchron, ADR-010).
+
+⚠ Annahme: Berechtigungsprüfungen (L) nutzen die beim Login ausgestellte Identität und zählen nicht als eigene Subdomäne. Ob das trägt, entscheidet Schritt 3.
+
+| Rang | Operation | IAM | Ticket | Purchase | Comm. | Balance | Cancel. | Rating | Notif. | Subdomänen | Einstufung |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | `createTicketOffer()` | (L) | S | | | | | | | 1 | lokal |
+| 2 | `searchTicket()` | | L | | | | | | | 1 | lokal |
+| 3 | `expressPurchaseInterest()` | (L) | L | S | S | | | | E | 3 | übergreifend |
+| 4 | `acceptOffer()` | | S | S | | S | | | | 3 | übergreifend |
+| 5 | `confirmTicketReceival()` | | S | S | | S | | | E | 3 | übergreifend |
+| 6 | `register()` | S | | | | S | | | | 2 | übergreifend |
+| 7 | `login()` | L | | | | | | | | 1 | lokal |
+| 8 | `sendMessage()` | (L) | | | S | | | | | 1 | lokal |
+| 9 | `updateBalance()` | (L) | | | | S | | | E | 1 | lokal |
+| 10 | `requestWithdrawl()` | (L) | | | | S | | | | 1 | lokal |
+| 11 | `viewBalance()` | | | | | L | | | | 1 | lokal |
+| 12 | `requestPurchaseCancellation()` | (L) | | L | | | S | | E | 2 | übergreifend |
+| 13 | `respondToCancellation()` | | | L | | | S | | E | 2 | übergreifend |
+| 14 | `expireCancellationDeadline()` | | (S) | L (S) | | (S) | S | | | 2–4 | übergreifend |
+| 15 | `requestTicketRelisting()` | | S | S | | S | S | | | 4 | übergreifend |
+| 16 | `approveCancellation()` | | S | S | | S | S | | E | 4 | übergreifend |
+| 17 | `requestTicketReceivalStatus()` | L | | L | S ⚠ | | | | | 3 | übergreifend |
+| 18 | `blockUser()` | S | | | | | L | | | 2 | übergreifend |
+| 19 | `withdrawTicketOffer()` | | S | S | | | | | E | 2 | übergreifend |
+| 20 | `updateTicketOffer()` | | S | | | | | | | 1 | lokal |
+| 21 | `expireTicketOffer()` | | S | S | | | | | | 2 | übergreifend |
+| 22 | `rateUser()` | L | | L | | | | S | | 3 | übergreifend |
+| 23 | `viewUserRatings()` | | | | | | | L | | 1 | lokal |
+| 24 | `viewOwnTicketOffers()` | | L | | | | | | | 1 | lokal |
+| 25 | `viewOwnPurchases()` | | L | L | | | | | | 2 | übergreifend |
+| 26 | `viewConversation()` | | | | L | | | | | 1 | lokal |
+| 27 | `viewBalanceTransactions()` | | | | | L | | | | 1 | lokal |
+| 28 | `viewOpenCancellations()` | | | L | | | L | | | 2 | übergreifend |
+| 29 | `viewPendingWithdrawals()` | L | | | | L | | | | 2 | übergreifend |
+| 30 | `findUserByCustomerNumber()` | L | | | | | | | | 1 | lokal |
+
+⚠ Bei `requestTicketReceivalStatus()` schreiben die Teamnotizen `Conversation` (Admin nutzt `sendMessage()`); die Spezifikation lässt „`Conversation` oder einen Supportvorgang" offen.
+
+**Ergebnis:** 17 von 30 Operationen sind subdomänenübergreifend (14 Kommandos, 3 Abfragen). Sie werden in Schritt 3 verteilt, sobald ihre Subdomänen in verschiedenen Services liegen, und brauchen dann ein Kollaborationsmuster (Saga, API Composition, CQRS). Kritisch sind `acceptOffer()`, `confirmTicketReceival()`, `requestTicketRelisting()` und `approveCancellation()`: Sie schreiben drei bis vier Subdomänen, darunter Balance.
+
+### Charakteristika der Subdomänen
+
+⚠ Annahme: Komplexität, Teamzuschnitt und technische Anforderungen sind vom Team geschätzt, nicht aus dem Brief. Sie sind nötig, um die Kräfte „Team autonomy", „Support multiple technology stacks" und „Segregate by characteristics" in Schritt 3 zu bewerten. Technische Anforderungen sind bewusst technologieneutral.
+
+| Subdomäne | Komplexität | Team | Technische Anforderungen | Charakteristik |
+| --- | --- | --- | --- | --- |
+| IAM | niedrig–mittel (Rollen, Sperre) | Plattform | Sichere Speicherung personenbezogener Daten und Passwort-Hashes; Standardlösung möglich | Security hoch; Ausfall blockiert alle Anmeldungen |
+| Ticket Management | mittel (Suche nach Strecke, Datum, Betreiber) | Marktplatz | Leseoptimierte, filterbare Suche | Höchste Leselast; Verfügbarkeit kritisch; unabhängig skalierbar |
+| Purchase Management | hoch (Zustandsautomat, zwei Zustimmungen, Nebenläufigkeit) | Marktplatz | Transaktionale Zustandsübergänge | Kern-Geschäftslogik; Robustheit |
+| Communication Management | mittel (Zustellung nahezu in Echtzeit) | Interaktion | Viele kleine Schreibzugriffe, Push an Empfänger | Hohe Schreiblast; Ausfall darf den Kauf nicht blockieren |
+| Balance Management | hoch (Geld, genau einmal, Revisionssicherheit) | Zahlungen | Strikt transaktional (ACID), lückenloses Buchungsjournal, Anbindung künftiger Zahlungsanbieter | Security und Konsistenz am höchsten; geringe Last; Zugriff durch Accounting |
+| Cancellation Management | mittel–hoch (Fristen, Streitfälle, Rückbuchung) | Interaktion | Zuverlässige Fristüberwachung | Selten genutzt, aber geldkritisch |
+| User Rating | niedrig | Interaktion | Einfache Speicherung, leseoptimierte Abfrage | Leselastig; unkritisch für den Kauf |
+| Notification | niedrig–mittel (mehrere Kanäle) | Plattform | Asynchrone Verarbeitung, Wiederholversuche | Darf ausfallen, ohne den Kernablauf zu blockieren (ADR-010) |
+
 ## Offene Architekturentscheidungen
 
 | Thema | Offene Frage |
@@ -698,5 +804,9 @@ sequenceDiagram
 | Statusmodelle | Sind die ergänzten Statuswerte (`Sold`, `Withdrawn`, `Expired`, `SellerConfirmed`, `Disputed`, `Requested`) und Übergänge korrekt? |
 | Benachrichtigungen | → ADR-010 |
 | Login | → ADR-011 |
+| Ranking | Ist das Vorziehen von `confirmTicketReceival()` von Rang 11 auf Rang 5 akzeptiert? |
+| Berechtigungsprüfung | Reicht die beim Login ausgestellte Identität für Berechtigungsprüfungen, oder müssen Operationen das `User`-Aggregate lesen? |
+| Admin-Nachfrage | Schreibt `requestTicketReceivalStatus()` in die `Conversation` (Teamnotizen) oder einen eigenen Supportvorgang (Spezifikation)? |
+| Subdomänen-Charakteristika | Sind Komplexität, Teamzuschnitt (Plattform, Marktplatz, Zahlungen, Interaktion) und technische Anforderungen so zutreffend? |
 
 Besonders für Auszahlungen muss das Auflösen einer zuvor angelegten Reservierung definiert werden. Andernfalls besteht das Risiko, dass bei einer späteren negativen `updateBalance()`-Buchung derselbe Betrag doppelt abgezogen wird.
