@@ -1,22 +1,25 @@
 # Systemoperationen
 
-Diese Spezifikation beschreibt die Systemoperationen nach dem Assemblage-Ansatz. Jede Operation enthält Signatur, fachliches Verhalten und nichtfunktionale Anforderungen. Die angegebenen Antwortzeiten sind Architekturvorschläge und keine gemessenen Grenzwerte.
+Diese Spezifikation beschreibt die Systemoperationen nach dem Assemblage-Ansatz. Jede Operation enthält Signatur, fachliches Verhalten und nichtfunktionale Anforderungen. Die angegebenen Antwortzeiten sind Architekturvorschläge und keine gemessenen Grenzwerte. Jede Operation ist mit ihren Haupttreibern markiert: V = Verfügbarkeit, U = Usability, S = Security, R = Robustheit. Ergänzungen, die nicht aus dem Projektbrief stammen, sind mit `⚠ Annahme:` gekennzeichnet und unter „Offene Architekturentscheidungen" gelistet.
 
 ## Domänenmodell – Aggregates
 
 | Aggregate | Beschreibung | Wichtige Daten |
 | --- | --- | --- |
-| `User` | Benutzerkonto und Benutzerstatus | UserId, Name, E-Mail, IBAN, Credentials, Status |
+| `User` | Benutzerkonto und Benutzerstatus | UserId, Benutzername, Vorname, Nachname, Geburtsdatum, E-Mail, Kundennummer (Betreff für Einzahlungen), IBAN, Credentials, Rolle (User / Admin / Accounting), Status |
 | `TicketOffer` | Zum Verkauf angebotenes Ticket | TicketId, SellerId, Start, End, ValidFrom, ValidUntil, Provider, Price, OriginalPrice, Status |
-| `Purchase` | Kaufvorgang zwischen Käufer und Verkäufer | PurchaseId, TicketId, BuyerId, SellerId, BuyerAccepted, SellerAccepted, Status |
+| `Purchase` | Kaufvorgang zwischen Käufer und Verkäufer | PurchaseId, TicketId, BuyerId, SellerId, AgreedPrice, BuyerAccepted, SellerAccepted, Status |
 | `Conversation` | Kommunikation zwischen Käufer und Verkäufer | ConversationId, Participants, Messages |
 | `BalanceAccount` | Guthabenkonto eines Benutzers | UserId, AvailableBalance, ReservedBalance, Transactions |
 | `Withdrawal` | Auszahlungsanforderung | WithdrawalId, UserId, Amount, Status |
 | `Cancellation` | Stornoantrag eines Käufers | CancellationId, PurchaseId, Reason, SellerResponse, Status, Deadline |
 | `RelistingRequest` | Antrag zum erneuten Anbieten eines Tickets | RequestId, TicketId, Reason, Status |
 | `Rating` | Bewertung eines Benutzers | RatingId, ReviewerId, RatedUserId, PurchaseId, Score, Comment |
+| `Notification` | Benachrichtigung an einen Benutzer (→ ADR-010) | NotificationId, RecipientId, Anlass (Event), Inhalt, Status |
 
 Aggregates sind fachliche Konsistenzgrenzen; daraus folgt nicht zwangsläufig eine Aufteilung in eigene Microservices.
+
+**Benachrichtigungen (→ ADR-010):** „Benachrichtigt" bedeutet in allen Operationen: Die Operation publiziert ein fachliches Event (z. B. Kaufinteresse bekundet, Stornoantrag gestellt). Die Subdomäne Notification reagiert asynchron darauf und stellt die Nachricht zu. Die auslösende Operation wartet nicht auf die Zustellung.
 
 ### Beziehungen der Aggregates
 
@@ -31,6 +34,7 @@ classDiagram
     class Cancellation
     class RelistingRequest
     class Rating
+    class Notification
 
     User "1" --> "0..*" TicketOffer : erstellt
     User "1" --> "0..*" Purchase : kauft
@@ -42,6 +46,64 @@ classDiagram
     TicketOffer "1" --> "0..*" RelistingRequest : hat
     Purchase "1" --> "0..*" Rating : Grundlage
     User "1" --> "0..*" Rating : verfasst
+    User "1" --> "0..*" Notification : erhält
+```
+
+### Statusmodelle
+
+⚠ Annahme: Die Statuswerte `Sold`, `Withdrawn`, `Expired`, `SellerConfirmed`, `Disputed` und `Requested` sind ergänzt; der Brief definiert keine Lebenszyklen. Übergänge, die von offenen ADRs abhängen, sind markiert.
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    state "TicketOffer" as TO {
+        [*] --> Available : createTicketOffer
+        Available --> Reserved : acceptOffer beide Zustimmungen
+        Reserved --> Sold : confirmTicketReceival
+        Reserved --> Available : requestTicketRelisting oder Storno genehmigt
+        Available --> Withdrawn : withdrawTicketOffer
+        Available --> Expired : expireTicketOffer
+        Sold --> [*]
+    }
+```
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    state "Purchase" as P {
+        [*] --> Pending : expressPurchaseInterest
+        Pending --> Accepted : acceptOffer beide Zustimmungen
+        Pending --> Cancelled : Ticket anderweitig verkauft, zurückgezogen oder abgelaufen
+        Accepted --> Completed : confirmTicketReceival
+        Accepted --> Cancelled : Storno genehmigt oder requestTicketRelisting
+        Completed --> [*]
+        Cancelled --> [*]
+    }
+```
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    state "Cancellation" as C {
+        [*] --> Requested : requestPurchaseCancellation
+        Requested --> SellerConfirmed : respondToCancellation ja
+        Requested --> Disputed : respondToCancellation nein
+        Requested --> Expired : expireCancellationDeadline
+        SellerConfirmed --> Approved : ADR-005
+        Expired --> Approved : Brief - Entscheidung für Käufer, ADR-005
+        Disputed --> Approved : approveCancellation
+        Disputed --> Rejected : approveCancellation
+    }
+```
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    state "Withdrawal" as W {
+        [*] --> Requested : requestWithdrawl
+        Requested --> Processed : Buchhaltung schließt ab, ADR-008
+        Processed --> [*]
+    }
 ```
 
 ## User – Registrierung und Authentifizierung
@@ -50,11 +112,13 @@ classDiagram
 
 **Signatur:** `register(userData: UserRegistrationData): UserId`
 
+**Treiber:** U · S
+
 **Verhalten**
 
 - Liest: `User` zur Prüfung eindeutiger Benutzername- und E-Mail-Werte.
 - Schreibt: `User` und initialisiert ein `BalanceAccount`.
-- Erstellt ein Benutzerkonto mit den angegebenen persönlichen Daten.
+- Erstellt ein Benutzerkonto mit den angegebenen persönlichen Daten (Vorname, Nachname, Geburtsdatum, Benutzername, E-Mail, IBAN), vergibt eine eindeutige Kundennummer und die Rolle `User`.
 - Speichert das Passwort ausschließlich gehasht.
 
 **Nichtfunktionale Anforderungen**
@@ -67,10 +131,12 @@ classDiagram
 
 **Signatur:** `login(username: String, password: String): AuthenticationResult`
 
+**Treiber:** S · V
+
 **Verhalten**
 
 - Liest: `User`.
-- Schreibt: keine fachlichen Aggregates im Normalfall.
+- Schreibt: keine fachlichen Aggregates. Der Brute-Force-Schutz (Zählen und Drosseln von Fehlversuchen) liegt im API Gateway (→ ADR-011).
 - Prüft Anmeldedaten und Benutzerstatus; bei Erfolg wird eine Sitzung beziehungsweise ein Token zurückgegeben.
 - Gesperrte Benutzer dürfen sich nicht anmelden.
 
@@ -84,6 +150,8 @@ classDiagram
 ### `searchTicket()`
 
 **Signatur:** `searchTicket(start: String, end: String, travelDate: Date, provider: String): List<TicketOffer>`
+
+**Treiber:** V · U
 
 **Verhalten**
 
@@ -99,6 +167,8 @@ classDiagram
 ### `createTicketOffer()`
 
 **Signatur:** `createTicketOffer(start: String, end: String, description: String, validFrom: DateTime, validUntil: DateTime, provider: String, price: Decimal, originalPrice: Decimal): TicketId`
+
+**Treiber:** U · V
 
 **Verhalten**
 
@@ -118,6 +188,8 @@ classDiagram
 
 **Signatur:** `expressPurchaseInterest(ticketId: TicketId): PurchaseId`
 
+**Treiber:** V · U
+
 **Verhalten**
 
 - Liest: `TicketOffer`, `User`.
@@ -134,6 +206,8 @@ classDiagram
 
 **Signatur:** `sendMessage(conversationId: ConversationId, content: String): MessageId`
 
+**Treiber:** U · V
+
 **Verhalten**
 
 - Liest: `Conversation`, `User`.
@@ -149,12 +223,16 @@ classDiagram
 
 **Signatur:** `acceptOffer(purchaseId: PurchaseId): PurchaseStatus`
 
+**Treiber:** R · S
+
 **Verhalten**
 
 - Liest: `Purchase`, `TicketOffer`, `BalanceAccount`.
 - Schreibt: `Purchase`, `TicketOffer`, `BalanceAccount`.
 - Speichert die Zustimmung der aufrufenden Kaufpartei.
-- Sobald Käufer und Verkäufer zugestimmt haben, wird der Kaufbetrag beim Käufer belastet oder reserviert, das Ticket als `Reserved` markiert und der Kaufstatus aktualisiert.
+- ⚠ Annahme: Der im Chat vereinbarte Preis wird als `AgreedPrice` im `Purchase` festgehalten; beide Zustimmungen beziehen sich auf denselben Preis. Wie der Preis übergeben wird, ist offen.
+- ⚠ Annahme: Das Verhalten bei unzureichendem Guthaben des Käufers ist offen.
+- Sobald Käufer und Verkäufer zugestimmt haben, wird der Kaufbetrag (`AgreedPrice`) beim Käufer belastet oder reserviert, das Ticket als `Reserved` markiert und der Kaufstatus aktualisiert.
 
 **Nichtfunktionale Anforderungen**
 
@@ -166,11 +244,14 @@ classDiagram
 
 **Signatur:** `confirmTicketReceival(purchaseId: PurchaseId): PurchaseStatus`
 
+**Treiber:** R · S
+
 **Verhalten**
 
 - Liest: `Purchase`, `BalanceAccount`.
-- Schreibt: `Purchase`, `BalanceAccount`.
+- Schreibt: `Purchase`, `BalanceAccount`, `TicketOffer`.
 - Prüft, dass der Aufrufer Käufer ist, bestätigt den Erhalt, gibt den reservierten Betrag für den Verkäufer frei und markiert den Vorgang als `Completed`.
+- ⚠ Annahme: Setzt das Ticket auf `Sold`, damit es nicht erneut angeboten werden kann.
 
 **Nichtfunktionale Anforderungen**
 
@@ -182,6 +263,8 @@ classDiagram
 ### `requestPurchaseCancellation()`
 
 **Signatur:** `requestPurchaseCancellation(purchaseId: PurchaseId, reason: String): CancellationId`
+
+**Treiber:** U · R
 
 **Verhalten**
 
@@ -197,6 +280,8 @@ classDiagram
 ### `respondToCancellation()`
 
 **Signatur:** `respondToCancellation(cancellationId: CancellationId, confirmed: Boolean): CancellationStatus`
+
+**Treiber:** U · R
 
 **Verhalten**
 
@@ -214,6 +299,8 @@ classDiagram
 ### `requestTicketRelisting()`
 
 **Signatur:** `requestTicketRelisting(ticketId: TicketId): RelistingRequestId`
+
+**Treiber:** R · S
 
 **Verhalten**
 
@@ -234,6 +321,8 @@ classDiagram
 
 **Signatur:** `rateUser(purchaseId: PurchaseId, ratedUserId: UserId, score: Integer, comment: String): RatingId`
 
+**Treiber:** R · S
+
 **Verhalten**
 
 - Liest: `Purchase`, `User`, `Rating`.
@@ -249,6 +338,8 @@ classDiagram
 
 **Signatur:** `viewUserRatings(userId: UserId): List<Rating>`
 
+**Treiber:** U · V
+
 **Verhalten**
 
 - Liest: `Rating`.
@@ -262,6 +353,8 @@ classDiagram
 ### `viewBalance()`
 
 **Signatur:** `viewBalance(): BalanceInformation`
+
+**Treiber:** U · S
 
 **Verhalten**
 
@@ -277,6 +370,8 @@ classDiagram
 ### `requestWithdrawl()`
 
 **Signatur:** `requestWithdrawl(amount: Decimal): WithdrawalId`
+
+**Treiber:** S · R
 
 **Verhalten**
 
@@ -295,6 +390,8 @@ classDiagram
 
 **Signatur:** `blockUser(userId: UserId): UserStatus`
 
+**Treiber:** S
+
 **Verhalten**
 
 - Liest: `User`, gegebenenfalls `Cancellation`.
@@ -310,6 +407,8 @@ classDiagram
 
 **Signatur:** `requestTicketReceivalStatus(purchaseId: PurchaseId): RequestId`
 
+**Treiber:** R · U
+
 **Verhalten**
 
 - Liest: `Purchase`, `User`.
@@ -324,6 +423,8 @@ classDiagram
 ### `approveCancellation()`
 
 **Signatur:** `approveCancellation(cancellationId: CancellationId, approved: Boolean): CancellationStatus`
+
+**Treiber:** R · S
 
 **Verhalten**
 
@@ -343,6 +444,8 @@ classDiagram
 
 **Signatur:** `updateBalance(userId: UserId, amount: Decimal): BalanceInformation`
 
+**Treiber:** S · R
+
 **Verhalten**
 
 - Liest: `User`, `BalanceAccount`.
@@ -355,6 +458,94 @@ classDiagram
 - Antwortzeit unter 2 Sekunden.
 - Hohe Datenkonsistenz und Transaktionssicherheit, keine unzulässigen negativen Guthabenstände.
 - Vollständige Protokollierung; Zugriff ausschließlich für autorisierte Buchhaltungsmitarbeiter.
+
+## User – Angebotsverwaltung (ergänzt)
+
+### `withdrawTicketOffer()`
+
+**Signatur:** `withdrawTicketOffer(ticketId: TicketId): TicketStatus`
+
+**Treiber:** U
+
+**Verhalten**
+
+- Liest: `TicketOffer`, `Purchase`.
+- Schreibt: `TicketOffer`, `Purchase`.
+- Prüft, dass der Aufrufer Verkäufer ist, setzt das Ticket auf `Withdrawn`, beendet offene `Pending`-Käufe als `Cancelled` und benachrichtigt die Interessenten.
+- ⚠ Annahme: Nur im Status `Available` zulässig; ein reserviertes Ticket wird über `requestTicketRelisting()` behandelt.
+
+**Nichtfunktionale Anforderungen**
+
+- Antwortzeit unter 2 Sekunden.
+- Zurückgezogene Angebote sind sofort nicht mehr in der Suche sichtbar.
+
+### `updateTicketOffer()`
+
+**Signatur:** `updateTicketOffer(ticketId: TicketId, changes: TicketOfferChanges): TicketId`
+
+**Treiber:** U
+
+**Verhalten**
+
+- Liest: `TicketOffer`.
+- Schreibt: `TicketOffer`.
+- Prüft Verkäuferrolle und validiert die geänderten Daten wie bei `createTicketOffer()`.
+- ⚠ Annahme: Nur im Status `Available` zulässig.
+
+**Nichtfunktionale Anforderungen**
+
+- Antwortzeit unter 2 Sekunden.
+
+## System – Zeitgesteuerte Operationen (ergänzt)
+
+### `expireCancellationDeadline()`
+
+**Signatur:** `expireCancellationDeadline(cancellationId: CancellationId): CancellationStatus` – ausgelöst bei Erreichen von `Cancellation.Deadline`.
+
+**Treiber:** R · U
+
+**Verhalten**
+
+- Liest: `Cancellation`, `Purchase`.
+- Schreibt: `Cancellation`; bei automatischer Stornierung zusätzlich `Purchase`, `BalanceAccount`, `TicketOffer`.
+- Wirkt nur, wenn der Verkäufer bis zur Frist nicht geantwortet hat; setzt den Antrag auf `Expired`.
+- Laut Brief wird in diesem Fall für den Käufer entschieden. Ob das direkt zur Stornierung mit Rückbuchung führt oder den Fall dem Admin vorlegt, entscheidet ADR-005.
+
+**Nichtfunktionale Anforderungen**
+
+- Die Frist wird zuverlässig überwacht, auch nach Ausfällen (keine verpasste Frist).
+- Idempotent: eine verspätete Verkäuferantwort und der Fristablauf führen nicht zu doppelter Rückbuchung.
+
+### `expireTicketOffer()`
+
+**Signatur:** `expireTicketOffer(ticketId: TicketId): TicketStatus` – ausgelöst bei Erreichen von `TicketOffer.ValidUntil`.
+
+**Treiber:** R · U
+
+**Verhalten**
+
+- Liest: `TicketOffer`, `Purchase`.
+- Schreibt: `TicketOffer`, `Purchase`.
+- Ein Ticket im Status `Available` wird auf `Expired` gesetzt und aus der Suche entfernt; offene `Pending`-Käufe werden `Cancelled`.
+- ⚠ Annahme: Das Verhalten für ein Ticket im Status `Reserved` (Kauf `Accepted`, Erhalt noch nicht bestätigt) ist offen.
+
+**Nichtfunktionale Anforderungen**
+
+- Abgelaufene Tickets erscheinen nicht mehr in `searchTicket()`.
+
+## Ergänzte Abfragen
+
+Reine Leseoperationen; sie schreiben keine Aggregates. Antwortzeiten sind Architekturvorschläge.
+
+| Operation | Signatur | Actor | Liest | Treiber | NFR |
+| --- | --- | --- | --- | --- | --- |
+| `viewOwnTicketOffers()` | `viewOwnTicketOffers(): List<TicketOffer>` | User (Verkäufer) | `TicketOffer` | U | < 1 s; nur eigene Angebote |
+| `viewOwnPurchases()` | `viewOwnPurchases(): List<Purchase>` | User (Käufer/Verkäufer) | `Purchase`, `TicketOffer` | U | < 1 s; nur eigene Käufe |
+| `viewConversation()` | `viewConversation(conversationId: ConversationId): List<Message>` | User | `Conversation` | U | < 1 s; nur Teilnehmer |
+| `viewBalanceTransactions()` | `viewBalanceTransactions(): List<Transaction>` | User | `BalanceAccount` | U · S | < 1 s; nur Kontoinhaber |
+| `viewOpenCancellations()` | `viewOpenCancellations(): List<Cancellation>` | Admin | `Cancellation`, `Purchase` | U · S | < 2 s; nur Admin |
+| `viewPendingWithdrawals()` | `viewPendingWithdrawals(): List<Withdrawal>` | Accounting | `Withdrawal`, `User` (IBAN) | U · S | < 2 s; nur Accounting |
+| `findUserByCustomerNumber()` | `findUserByCustomerNumber(customerNumber: String): UserInfo` | Accounting | `User` | U · S | < 1 s; nur Accounting; ordnet Einzahlungen über den Betreff zu |
 
 ## Sequenzdiagramme
 
@@ -396,6 +587,7 @@ sequenceDiagram
     Käufer->>App: confirmTicketReceival(purchaseId)
     App->>Purchase: Käuferberechtigung prüfen
     App->>Balance: Reservierung freigeben und Verkäufer gutschreiben
+    App->>Ticket: Status auf Sold setzen
     App->>Purchase: Status auf Completed setzen
     App-->>Verkäufer: Kaufabschluss bestätigen
 ```
@@ -425,6 +617,7 @@ sequenceDiagram
     else Verkäufer widerspricht oder Frist läuft ab
         App-->>Admin: Streitfall zur Entscheidung vorlegen
     end
+    Note over App,Admin: ⚠ Bei Fristablauf entscheidet laut Brief das System für den Käufer - siehe ADR-005
 
     Admin->>App: approveCancellation(cancellationId, approved)
     alt Storno genehmigt
@@ -467,6 +660,26 @@ sequenceDiagram
     App-->>Nutzer: Auszahlung bestätigt
 ```
 
+### Einzahlung
+
+```mermaid
+sequenceDiagram
+    actor Buchhaltung
+    actor Nutzer
+    participant App as Ticket-App
+    participant Balance as BalanceAccount
+    participant Bank as Bankensystem
+
+    Nutzer->>Bank: Überweisung mit Kundennummer als Betreff
+    Bank-->>Buchhaltung: Zahlungseingang im Kontoauszug
+    Buchhaltung->>App: findUserByCustomerNumber(customerNumber)
+    App-->>Buchhaltung: UserId
+    Buchhaltung->>App: updateBalance(userId, +amount)
+    App->>Balance: Berechtigung prüfen
+    App->>Balance: Guthaben erhöhen und Buchung dokumentieren
+    App-->>Nutzer: Einzahlung gutgeschrieben
+```
+
 ## Offene Architekturentscheidungen
 
 | Thema | Offene Frage |
@@ -478,5 +691,12 @@ sequenceDiagram
 | Guthaben | Wird Geld beim Kauf sofort abgebucht oder zunächst reserviert? |
 | Accounting | Wie wird eine manuelle Auszahlung als abgeschlossen dokumentiert, ohne das Guthaben doppelt zu belasten? |
 | Bewertungen | Darf jeder Benutzer bewerten oder nur nach einem abgeschlossenen Kauf? |
+| Preis | Wie wird der im Chat vereinbarte Preis verbindlich als `AgreedPrice` im `Purchase` festgehalten (Parameter von `acceptOffer()` oder eigene Operation)? |
+| Kaufabschluss | Was passiert bei `acceptOffer()`, wenn das Guthaben des Käufers nicht ausreicht (Ablehnung, Zustimmung bleibt offen bis Einzahlung, …)? |
+| Ticket-Gültigkeit | Was passiert mit einem Kauf im Status `Accepted`, wenn `ValidUntil` des Tickets abläuft (`expireTicketOffer()`)? |
+| Angebotsverwaltung | Darf ein Angebot mit offenen `Pending`-Käufen bearbeitet oder zurückgezogen werden? |
+| Statusmodelle | Sind die ergänzten Statuswerte (`Sold`, `Withdrawn`, `Expired`, `SellerConfirmed`, `Disputed`, `Requested`) und Übergänge korrekt? |
+| Benachrichtigungen | → ADR-010 |
+| Login | → ADR-011 |
 
 Besonders für Auszahlungen muss das Auflösen einer zuvor angelegten Reservierung definiert werden. Andernfalls besteht das Risiko, dass bei einer späteren negativen `updateBalance()`-Buchung derselbe Betrag doppelt abgezogen wird.
