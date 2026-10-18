@@ -195,6 +195,49 @@ Status: `offen` · `akzeptiert` · `ersetzt durch ADR-xxx`.
 | Konsequenzen | (+) Einfachster Service, keine Laufzeitkopplung, die hohe Leselast der Suche ist von IAM getrennt. (+) Team Marktplatz kann unabhängig liefern (Teamzuschnitt siehe Schritt 2). (−) Ein gesperrter Benutzer kann bis zum Ablauf seiner Anmeldung noch Angebote anlegen. (−) Ob Purchase Management später in denselben Service kommt, ist offen (Entscheidung bei `expressPurchaseInterest()`). |
 | Treiber | Verfügbarkeit, Usability |
 
+## ADR-016 – Ereignisreihenfolge zwischen Ticket Service und Conversation Service
+
+| Feld | Inhalt |
+| --- | --- |
+| Status | offen |
+| Kontext | Der Ticket Service veröffentlicht Events, die vom Conversation Service verarbeitet werden. Da die Kommunikation asynchron erfolgt, kann nicht garantiert werden, dass Events in der richtigen Reihenfolge eintreffen. Dadurch könnten Nachrichten oder Statusänderungen falsch verarbeitet werden. |
+| Entscheidung | Noch offen. Empfohlen wird, Events pro PurchaseId geordnet zu verarbeiten und Zustandsübergänge im Conversation Service zu validieren. |
+| Alternativen | **A) Geordnete Eventverarbeitung pro PurchaseId.** Gewinnt bei Konsistenz und nachvollziehbaren Abläufen. Nachteil: zusätzliche technische Komplexität. **B) Ungeordnete Verarbeitung mit Versionsprüfung.** Gewinnt bei Skalierbarkeit und geringerer Kopplung. Nachteil: veraltete Events müssen erkannt und behandelt werden. **C) Synchrone Kommunikation.** Gewinnt bei unmittelbarer Rückmeldung. Nicht bevorzugt, da Ausfälle des Conversation Service den Ticket Service blockieren könnten. |
+| Konsequenzen | (+) Konsistente Verarbeitung zusammengehöriger Events. (+) Weniger fehlerhafte Zustandsübergänge. (−) Zusätzlicher Aufwand für Eventverarbeitung, Wiederholungen und Fehlerbehandlung. |
+| Treiber | Robustheit, Verfügbarkeit |
+
+## ADR-017 – Identität und Zuordnung von Chat-Nachrichten
+
+| Feld | Inhalt |
+| --- | --- |
+| Status | offen |
+| Kontext | Jede Conversation gehört zu einem Purchase. Beim Senden einer Nachricht muss sichergestellt werden, dass der Benutzer tatsächlich am Kauf beteiligt ist. Eine frei übergebene UserId darf nicht als vertrauenswürdige Absenderidentität verwendet werden. |
+| Entscheidung | Noch offen. Empfohlen wird, die Absenderidentität aus dem authentifizierten Kontext zu übernehmen. Jede Conversation wird eindeutig einer PurchaseId zugeordnet. |
+| Alternativen | **A) Absenderidentität aus dem Authentifizierungskontext.** Gewinnt bei Security und verhindert die Manipulation der Absenderidentität. **B) UserId als Request-Parameter.** Gewinnt bei einfacher Implementierung, ermöglicht jedoch Identitätsmanipulation ohne zusätzliche Prüfung. **C) Synchrone Berechtigungsprüfung beim Ticket Service für jede Nachricht.** Gewinnt bei aktuellen Berechtigungen, erhöht jedoch die Laufzeitkopplung und reduziert die Verfügbarkeit. |
+| Konsequenzen | (+) Nachrichten können nicht unter einer beliebigen Benutzeridentität gesendet werden. (+) Eindeutige Zuordnung zwischen Purchase und Conversation. (−) Der Conversation Service benötigt verlässliche Informationen über die beteiligten Benutzer. |
+| Treiber | Security, Verfügbarkeit, Robustheit |
+
+## ADR-018 – Auszahlungsanforderungen und manuelle Buchhaltung
+
+| Feld | Inhalt |
+| --- | --- |
+| Status | offen |
+| Kontext | Auszahlungen erfolgen in der ersten Iteration manuell durch die Buchhaltung. `requestWithdrawl()` fordert eine Auszahlung an und reserviert den entsprechenden Betrag. `updateBalance()` wird anschließend zur manuellen Verbuchung verwendet. Dabei besteht das Risiko, dass Guthaben doppelt belastet oder eine Auszahlung mehrfach durchgeführt wird. |
+| Entscheidung | Noch offen. Empfohlen wird, Auszahlungsanforderungen mit einer eindeutigen WithdrawalId und einem eigenen Status zu verwalten. Die abschließende Verbuchung soll idempotent erfolgen und die Reservierung auflösen. |
+| Alternativen | **A) Eigener Auszahlungsabschluss mit WithdrawalId.** Gewinnt bei Security, Nachvollziehbarkeit und Vermeidung doppelter Buchungen. Nachteil: zusätzliche Operation und Zustandsverwaltung. **B) Abschluss über `updateBalance()`.** Gewinnt bei geringerem Implementierungsaufwand. Nachteil: unterschiedliche Buchungsvorgänge werden vermischt und die Gefahr von Doppelbelastungen steigt. **C) Automatische Bankintegration.** Gewinnt bei Geschwindigkeit und Automatisierung. Nicht gewählt, da die erste Iteration laut Projektbrief manuelle Banküberweisungen vorsieht. |
+| Konsequenzen | (+) Auszahlungen sind nachvollziehbar und eindeutig identifizierbar. (+) Doppelte Guthabenbelastungen können verhindert werden. (−) Zusätzliche Zustände und Validierungsregeln werden benötigt. |
+| Treiber | Security, Robustheit |
+
+## ADR-019 – Zuverlässige Eventpublikation und Zustellung
+
+| Feld | Inhalt |
+| --- | --- |
+| Status | offen |
+| Kontext | Mehrere Services kommunizieren über asynchrone Events. Beispielsweise informieren Ticket Service, Balance Service und Cancellation Service andere Services über fachliche Zustandsänderungen. Schlägt die Eventpublikation nach einer erfolgreichen Datenbankänderung fehl, können andere Services einen veralteten Zustand behalten. Außerdem können Events mehrfach zugestellt werden. |
+| Entscheidung | Noch offen. Empfohlen wird das Transactional-Outbox-Pattern für die zuverlässige Eventpublikation sowie eine idempotente Eventverarbeitung durch die empfangenden Services. |
+| Alternativen | **A) Transactional Outbox mit idempotenten Consumern.** Gewinnt bei Robustheit, da Datenänderung und Speicherung des Events atomar erfolgen. Nachteil: zusätzliche Infrastruktur und Verarbeitung. **B) Direkte Eventpublikation nach dem Datenbank-Commit.** Gewinnt bei Einfachheit. Nachteil: Events können bei einem Ausfall verloren gehen. **C) Synchrone Serviceaufrufe.** Gewinnt bei unmittelbarer Fehlererkennung. Nicht bevorzugt, da dadurch Laufzeitkopplung entsteht und die Verfügbarkeit sinkt. |
+| Konsequenzen | (+) Fachliche Events gehen bei temporären Ausfällen nicht verloren, sofern die Outbox zuverlässig verarbeitet wird. (+) Doppelte Zustellungen verursachen bei korrekter Idempotenz keine mehrfachen fachlichen Änderungen. (−) Zusätzlicher Aufwand für Outbox-Verarbeitung, Retry-Mechanismen und Monitoring. (−) Eventual Consistency bleibt bestehen. |
+| Treiber | Robustheit, Verfügbarkeit, Security |
 ---
 
 ## Vorlage für neue ADRs
