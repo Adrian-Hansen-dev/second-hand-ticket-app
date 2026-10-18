@@ -213,3 +213,245 @@ sequenceDiagram
   Falls die Belastung vor dem Fehler schon erfolgt war, wird stattdessen
   `FUNDS_REFUNDED` gespeichert. Erst danach wird die Saga endgültig als
   `FAILED` abgeschlossen und die Lease freigegeben.
+
+## Fehlerpfad 2a: Timeout bei der Produktreservierung
+
+Ein Timeout bei `reserveStock` ist kein sicherer Fehler: Der Produkt Service
+könnte den Bestand bereits reserviert haben, bevor die Antwort verloren ging.
+
+### 2a.1 Retry der Produktreservierung ist erfolgreich
+
+```mermaid
+flowchart LR
+    VS[Verkaufsservice]
+    LS[Limit Service]
+    AS[Account Service]
+    PS[Produkt Service]
+
+    VS -->|1. Limit reservieren| LS
+    VS -->|2. Guthaben reservieren| AS
+    VS -->|3. Produkt reservieren Timeout| PS
+    VS -->|4. Produktreservierung mit gleicher saleId wiederholen| PS
+    VS -->|5. Kauf fortsetzen| AS
+```
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant VS as Verkaufsservice
+    participant LS as Limit Service
+    participant AS as Account Service
+    participant PS as Produkt Service
+
+    VS->>LS: reserveLimit(saleId)
+    LS-->>VS: RESERVED
+    VS->>VS: Saga LIMIT_RESERVED speichern
+    VS->>AS: reserveFunds(saleId)
+    AS-->>VS: RESERVED
+    VS->>VS: Saga FUNDS_RESERVED speichern
+
+    VS->>PS: reserveStock(saleId)
+    PS-->>VS: TIMEOUT
+    VS->>VS: PRODUCT_RESERVATION_PENDING speichern
+    Note right of PS: Produkt Ergebnis ist unbekannt
+    VS->>PS: reserveStock(saleId) idempotent wiederholen
+    PS-->>VS: RESERVED
+    VS->>VS: Saga STOCK_RESERVED speichern
+    VS->>AS: captureFunds(saleId)
+    AS-->>VS: CONFIRMED
+    VS->>LS: confirmLimit(saleId)
+    LS-->>VS: CONFIRMED
+    VS->>PS: commitStock(saleId)
+    PS-->>VS: CONFIRMED
+    VS->>VS: Saga COMPLETED speichern und Lease freigeben
+```
+
+#### Entscheidung in 2a.1
+
+- Der Verkaufsservice speichert `PRODUCT_RESERVATION_PENDING`. Sobald Product
+  Service nach dem Timeout wieder antwortet, wird exakt derselbe
+  `reserveStock`-Aufruf mit derselben `saleId` wiederholt. Der Produkt Service
+  liefert dann entweder die schon vorhandene Reservierung oder legt genau eine
+  neue an.
+- Weil der Retry `RESERVED` zurückgibt, wird der Kauf normal fortgesetzt. Die
+  idempotente `saleId` stellt sicher, dass der Bestand höchstens einmal
+  reserviert wird.
+
+### 2a.2 Retry der Produktreservierung scheitert erneut
+
+```mermaid
+flowchart LR
+    VS[Verkaufsservice]
+    LS[Limit Service]
+    AS[Account Service]
+    PS[Produkt Service]
+
+    VS -->|1. Limit reservieren| LS
+    VS -->|2. Guthaben reservieren| AS
+    VS -->|3. Produkt reservieren Timeout| PS
+    VS -->|4. Produktreservierung erneut Fehler| PS
+    VS -->|5. Guthaben freigeben| AS
+    VS -->|6. Limit freigeben| LS
+    VS -->|7. Produktkompensation erneut senden| PS
+```
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant VS as Verkaufsservice
+    participant LS as Limit Service
+    participant AS as Account Service
+    participant PS as Produkt Service
+
+    VS->>LS: reserveLimit(saleId)
+    LS-->>VS: RESERVED
+    VS->>AS: reserveFunds(saleId)
+    AS-->>VS: RESERVED
+    VS->>PS: reserveStock(saleId)
+    PS-->>VS: TIMEOUT
+    VS->>VS: PRODUCT_RESERVATION_PENDING speichern
+    VS->>PS: reserveStock(saleId) idempotent wiederholen
+    PS-->>VS: ERROR
+    VS->>VS: Saga COMPENSATING speichern
+    VS->>AS: releaseFunds(saleId)
+    AS-->>VS: RELEASED
+    VS->>LS: releaseLimit(saleId)
+    LS-->>VS: RELEASED
+    VS->>VS: PRODUCT_RECONCILIATION_PENDING speichern
+    VS->>PS: releaseStock(saleId) idempotent wiederholen
+    PS-->>VS: RELEASED oder NOT_RESERVED
+    VS->>VS: Saga FAILED speichern und Lease freigeben
+```
+
+#### Entscheidung in 2a.2
+
+- Guthaben und Limit werden sofort freigegeben, weil deren Reservierungen
+  sicher bekannt sind.
+- `PRODUCT_RECONCILIATION_PENDING` bleibt gespeichert, bis der Produkt Service
+  die idempotente Freigabe bestätigt. `releaseStock(saleId)` löst dann eine
+  möglicherweise durch einen der beiden Aufrufe entstandene Produktreservierung
+  auf.
+- Das entspricht dem Kompensationsmuster aus Fehlerpfad 1: Der fehlgeschlagene
+  Kauf wird nicht fortgesetzt, aber jede unbekannte Teilwirkung wird später
+  idempotent bereinigt.
+
+## Fehlerpfad 2b: Timeout beim endgültigen Abbuchen des Bestands
+
+Hier sind Limit und Guthaben bereits endgültig gebucht. Der Timeout bei
+`commitStock` lässt offen, ob der Bestand schon abgebucht wurde.
+
+### 2b.1 Retry des Bestandsabbuchens ist erfolgreich
+
+```mermaid
+flowchart LR
+    VS[Verkaufsservice]
+    LS[Limit Service]
+    AS[Account Service]
+    PS[Produkt Service]
+
+    VS -->|1. Limit reservieren| LS
+    VS -->|2. Guthaben reservieren| AS
+    VS -->|3. Produkt reservieren| PS
+    VS -->|4. Konto belasten| AS
+    VS -->|5. Limit abbuchen| LS
+    VS -->|6. Bestand abbuchen Timeout| PS
+    VS -->|7. Bestand mit gleicher saleId erneut abbuchen| PS
+```
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant VS as Verkaufsservice
+    participant LS as Limit Service
+    participant AS as Account Service
+    participant PS as Produkt Service
+
+    VS->>LS: reserveLimit(saleId)
+    LS-->>VS: RESERVED
+    VS->>AS: reserveFunds(saleId)
+    AS-->>VS: RESERVED
+    VS->>PS: reserveStock(saleId)
+    PS-->>VS: RESERVED
+    VS->>AS: captureFunds(saleId)
+    AS-->>VS: CONFIRMED
+    VS->>LS: confirmLimit(saleId)
+    LS-->>VS: CONFIRMED
+
+    VS->>PS: commitStock(saleId)
+    PS-->>VS: TIMEOUT
+    VS->>VS: PRODUCT_COMMIT_RECONCILIATION_PENDING speichern
+    Note right of PS: Produkt Ergebnis ist unbekannt
+    VS->>PS: commitStock(saleId) idempotent wiederholen
+    PS-->>VS: CONFIRMED
+    VS->>VS: Saga COMPLETED speichern und Lease freigeben
+```
+
+#### Entscheidung in 2b.1
+
+- Geld und Limit werden nicht sofort kompensiert, weil der erste
+  `commitStock`-Aufruf trotz Timeout bereits erfolgreich gewesen sein kann.
+- Derselbe idempotente `commitStock(saleId)`-Aufruf liefert beim Retry
+  `CONFIRMED`, unabhängig davon, ob der erste oder der zweite Aufruf die
+  Bestandsbuchung tatsächlich durchgeführt hat.
+
+### 2b.2 Retry des Bestandsabbuchens scheitert erneut
+
+```mermaid
+flowchart LR
+    VS[Verkaufsservice]
+    LS[Limit Service]
+    AS[Account Service]
+    PS[Produkt Service]
+
+    VS -->|1. Limit reservieren| LS
+    VS -->|2. Guthaben reservieren| AS
+    VS -->|3. Produkt reservieren| PS
+    VS -->|4. Konto belasten| AS
+    VS -->|5. Limit abbuchen| LS
+    VS -->|6. Bestand abbuchen Timeout| PS
+    VS -->|7. Bestand erneut Fehler| PS
+    VS -->|8. Geld erstatten| AS
+    VS -->|9. Limit zurueckrollen| LS
+```
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant VS as Verkaufsservice
+    participant LS as Limit Service
+    participant AS as Account Service
+    participant PS as Produkt Service
+
+    VS->>LS: reserveLimit(saleId)
+    LS-->>VS: RESERVED
+    VS->>AS: reserveFunds(saleId)
+    AS-->>VS: RESERVED
+    VS->>PS: reserveStock(saleId)
+    PS-->>VS: RESERVED
+    VS->>AS: captureFunds(saleId)
+    AS-->>VS: CONFIRMED
+    VS->>LS: confirmLimit(saleId)
+    LS-->>VS: CONFIRMED
+
+    VS->>PS: commitStock(saleId)
+    PS-->>VS: TIMEOUT
+    VS->>VS: PRODUCT_COMMIT_RECONCILIATION_PENDING speichern
+    VS->>PS: commitStock(saleId) idempotent wiederholen
+    PS-->>VS: ERROR
+    VS->>PS: getCommitStatus(saleId)
+    PS-->>VS: NOT_RESERVED
+    VS->>AS: refundFunds(saleId)
+    AS-->>VS: REFUNDED
+    VS->>LS: rollbackLimit(saleId)
+    LS-->>VS: ROLLED_BACK
+    VS->>VS: Saga FAILED speichern und Lease freigeben
+```
+
+#### Entscheidung in 2b.2
+
+- Nach einem zweiten Fehler wird anhand der idempotenten `saleId` der
+  Produktstatus abgefragt. Dieses Diagramm zeigt den Fall `NOT_RESERVED`.
+- Weil kein Produkt verbindlich gebucht wurde, wird die bereits erfolgte
+  Zahlung erstattet und das Tageslimit zurückgerollt.
+- Ergibt die Statusabfrage stattdessen `CONFIRMED`, gilt dieselbe erfolgreiche
+  Auflösung wie in 2b.1; es wird weder erstattet noch zurückgerollt.
