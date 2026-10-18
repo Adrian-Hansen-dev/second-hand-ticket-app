@@ -238,6 +238,41 @@ Status: `offen` · `akzeptiert` · `ersetzt durch ADR-xxx`.
 | Alternativen | **A) Transactional Outbox mit idempotenten Consumern.** Gewinnt bei Robustheit, da Datenänderung und Speicherung des Events atomar erfolgen. Nachteil: zusätzliche Infrastruktur und Verarbeitung. **B) Direkte Eventpublikation nach dem Datenbank-Commit.** Gewinnt bei Einfachheit. Nachteil: Events können bei einem Ausfall verloren gehen. **C) Synchrone Serviceaufrufe.** Gewinnt bei unmittelbarer Fehlererkennung. Nicht bevorzugt, da dadurch Laufzeitkopplung entsteht und die Verfügbarkeit sinkt. |
 | Konsequenzen | (+) Fachliche Events gehen bei temporären Ausfällen nicht verloren, sofern die Outbox zuverlässig verarbeitet wird. (+) Doppelte Zustellungen verursachen bei korrekter Idempotenz keine mehrfachen fachlichen Änderungen. (−) Zusätzlicher Aufwand für Outbox-Verarbeitung, Retry-Mechanismen und Monitoring. (−) Eventual Consistency bleibt bestehen. |
 | Treiber | Robustheit, Verfügbarkeit, Security |
+
+
+## ADR-020 – Wirksamkeit von Benutzersperren
+
+| Feld | Inhalt |
+| --- | --- |
+| Status | offen |
+| Kontext | `blockUser()` sperrt einen Benutzer im IAM Service. Laut ADR-014 verwenden andere Services die beim Login ausgestellte Identität, ohne den Benutzerstatus bei jeder Anfrage synchron zu prüfen. Dadurch könnten gesperrte Benutzer mit einem bereits gültigen Token weiterhin Aktionen durchführen. |
+| Entscheidung | Noch offen. Empfohlen werden kurzlebige Access Tokens und ein zentraler Widerrufsmechanismus für sicherheitskritische Sperrungen. |
+| Alternativen | **A) Kurzlebige Tokens mit Widerrufsmechanismus.** Gewinnt bei Security und begrenzter Laufzeitkopplung. Nachteil: zusätzlicher Verwaltungsaufwand. **B) IAM bei jeder Anfrage synchron prüfen.** Gewinnt bei sofortiger Durchsetzung von Sperren. Nicht bevorzugt, weil IAM-Ausfälle andere Services blockieren. **C) Sperrstatus über Events verteilen.** Gewinnt bei Verfügbarkeit. Nachteil: verzögerte und möglicherweise inkonsistente Sperrwirkung. |
+| Konsequenzen | (+) Sperrungen können auch bei bestehenden Sitzungen wirksam werden. (+) Sicherheitsrisiken durch weiterhin gültige Tokens werden reduziert. (−) Zusätzliche Infrastruktur für Token-Widerruf oder Sperrlisten. |
+| Treiber | Security, Verfügbarkeit |
+
+## ADR-021 – Zuordnung der Benutzerbewertungen
+
+| Feld | Inhalt |
+| --- | --- |
+| Status | offen |
+| Kontext | `rateUser()` benötigt Informationen über einen Kaufvorgang und speichert eine Bewertung im Aggregate Rating. `viewUserRatings()` liest ausschließlich Bewertungen. Offen ist, ob dafür ein eigener Service notwendig ist oder User Rating einem bestehenden Service zugeordnet wird. |
+| Entscheidung | Noch offen. Empfohlen wird, User Rating dem bestehenden User Service zuzuordnen, sofern dieser Benutzerprofile verwaltet. Die Berechtigung zur Bewertung wird anhand des zugehörigen Purchase geprüft. |
+| Alternativen | **A) User Rating im User Service.** Gewinnt bei einfachen Komponenten und geringem Betriebsaufwand. Nachteil: Abhängigkeit zur Kaufverwaltung bei Berechtigungsprüfungen. **B) Eigener Rating Service.** Gewinnt bei unabhängiger Skalierung und Teamautonomie. Nicht bevorzugt, weil zusätzliche Servicekommunikation und Infrastruktur entstehen. **C) User Rating im Ticket Service.** Gewinnt bei lokaler Prüfung der Kaufberechtigung. Nachteil: Bewertungen werden mit der Ticket- und Kauflogik gekoppelt. |
+| Konsequenzen | (+) Kein zusätzlicher Microservice notwendig. (+) Bewertungen können unabhängig vom Kaufabschluss gelesen werden. (−) Die Berechtigung zur Bewertung benötigt Informationen über abgeschlossene Kaufvorgänge. |
+| Treiber | Usability, Verfügbarkeit, Robustheit |
+
+## ADR-022 – Serviceübergreifende Leseoperationen
+
+| Feld | Inhalt |
+| --- | --- |
+| Status | offen |
+| Kontext | Einige Leseoperationen benötigen Informationen aus mehreren Subdomänen, beispielsweise `viewOpenCancellations()` mit Cancellation und Purchase sowie `viewPendingWithdrawals()` mit Withdrawal und User. Eine direkte gemeinsame Datenbankabfrage über Servicegrenzen würde die Unabhängigkeit der Services verletzen. |
+| Entscheidung | Noch offen. Empfohlen wird, lokale Abfragen direkt beim datenverantwortlichen Service auszuführen und serviceübergreifende Informationen bei Bedarf über API Composition zusammenzuführen. |
+| Alternativen | **A) API Composition.** Gewinnt bei einfacher Umsetzung ohne redundante Datenhaltung. Nachteil: zusätzliche Laufzeitabhängigkeiten. **B) CQRS mit lokalen Read Models.** Gewinnt bei Verfügbarkeit und schnellen Abfragen. Nachteil: zusätzliche Eventverarbeitung und Eventual Consistency. **C) Gemeinsame Datenbankabfragen.** Gewinnt bei einfacher Datenzusammenführung. Nicht bevorzugt, weil dadurch Datenhoheit und unabhängige Weiterentwicklung der Services beeinträchtigt werden. |
+| Konsequenzen | (+) Klare Datenverantwortung der Services. (+) Keine direkte Kopplung zwischen den Datenbanken. (−) Zusammengesetzte Abfragen können bei Ausfällen einzelner Services eingeschränkt sein. |
+| Treiber | Verfügbarkeit, Usability, Robustheit |
+
 ---
 
 ## Vorlage für neue ADRs
