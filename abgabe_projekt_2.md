@@ -5,6 +5,16 @@ der Reservierungen und kennt als einziger Service den vollständigen Zustand ein
 Verkaufsvorgangs. `saleId` ist ein vom Client erzeugter Idempotenzschlüssel; jede
 Reservierung und jede Kompensation wird mit derselben `saleId` ausgeführt.
 
+## Gemeinsame Persistenz- und Ereignisregel
+
+Jeder mit **„speichern“** bezeichnete Schritt schreibt den jeweiligen Status
+atomar in die lokale Datenhaltung des betroffenen Services. Dargestellte
+Ereignisse werden zusammen mit dieser Statusänderung dauerhaft als ausgehende
+Nachricht gespeichert und können mit derselben `saleId` erneut zugestellt
+werden. So sind Zustellung, Retry und Recovery nachvollziehbar, ohne eine
+Datenbank oder ein konkretes Messaging-System als zusätzlichen Teilnehmer in
+den Diagrammen zu zeigen.
+
 ## Happy Path: Komponentendiagramm
 
 ```mermaid
@@ -750,20 +760,30 @@ sequenceDiagram
 
     LS-->>PS: LimitConfirmed event
     PS->>PS: Zweiter commitStock Versuch schlaegt fehl
+    PS->>PS: PRODUCT_COMMIT_RECONCILIATION_PENDING speichern
+    PS->>PS: Commit Status nach Recovery mit saleId aufloesen
+    alt Bestand war bereits abgebucht
+        PS->>PS: Bestand freigeben und STOCK_RELEASED speichern
+    else Bestand war nicht abgebucht
+        PS->>PS: Reservierung loeschen und STOCK_RELEASED speichern
+    end
     PS-->>AS: ProductCommitFailed event
     PS-->>LS: ProductCommitFailed event
     AS->>AS: Guthaben erstatten und FUNDS_REFUNDED speichern
     LS->>LS: Limit zurueckrollen und LIMIT_ROLLED_BACK speichern
     AS-->>PS: FundsRefunded event
     LS-->>PS: LimitRolledBack event
-    PS->>PS: Unklare Bestandsbuchung nach Recovery bereinigen
 ```
 
 #### Entscheidung in 2b.2
 
-- Erst nach dem zweiten fehlgeschlagenen Verarbeitungsversuch publiziert Product
-  Service `ProductCommitFailed`. Dadurch wird nicht versehentlich erstattet,
-  obwohl die erste Bestandsbuchung bereits erfolgreich war.
+- Nach dem zweiten fehlgeschlagenen Verarbeitungsversuch hält Product Service
+  zunächst `PRODUCT_COMMIT_RECONCILIATION_PENDING` fest. Erst nachdem der
+  Bestand mit derselben `saleId` aufgelöst wurde, publiziert er
+  `ProductCommitFailed`. Dadurch wird nicht versehentlich erstattet, obwohl die
+  erste Bestandsbuchung bereits erfolgreich war.
 - Account und Limit kompensieren ihre endgültigen Buchungen als Reaktion auf das
   Fehlerereignis. Product Service bereinigt seine unklare Teilwirkung
-  idempotent, sobald sein eigener Zustand wieder verfügbar ist.
+  idempotent, sobald sein eigener Zustand wieder verfügbar ist. War der Bestand
+  trotz Timeout bereits abgebucht, gibt Product Service ihn vor dem Abschluss
+  der Kompensation wieder frei.
