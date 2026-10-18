@@ -94,7 +94,6 @@ ob der Service die Reservierung kurz vor dem Fehler bereits gespeichert hat.
 
 ```mermaid
 flowchart LR
-    VS[Verkaufsservice]
     LS[Limit Service]
     AS[Account Service]
 
@@ -455,3 +454,316 @@ sequenceDiagram
   Zahlung erstattet und das Tageslimit zurückgerollt.
 - Ergibt die Statusabfrage stattdessen `CONFIRMED`, gilt dieselbe erfolgreiche
   Auflösung wie in 2b.1; es wird weder erstattet noch zurückgerollt.
+
+# Choreographie
+
+Bei der Choreographie startet der Kunde den Kauf beim Limit Service. Die
+Fachservices entscheiden anhand von Ereignissen selbst, welchen Schritt oder
+welche Kompensation sie ausführen. Die Pfeile mit
+`... event` stehen für dauerhaft publizierte Ereignisse; ein konkretes
+Messaging-System wird hier bewusst nicht festgelegt.
+
+## Happy Path: Komponentendiagramm
+
+```mermaid
+flowchart LR
+    LS[Limit Service]
+    AS[Account Service]
+    PS[Produkt Service]
+
+    LS -->|1. LimitReserved event| AS
+    AS -->|2. FundsReserved event| PS
+    PS -->|3. StockReserved event| AS
+    AS -->|4. FundsCaptured event| LS
+    LS -->|5. LimitConfirmed event| PS
+```
+
+## Ablauf eines erfolgreichen Verkaufs
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Kunde
+    participant LS as Limit Service
+    participant AS as Account Service
+    participant PS as Produkt Service
+
+    Kunde->>LS: SaleRequested event
+    LS->>LS: Limit reservieren und LIMIT_RESERVED speichern
+    LS-->>AS: LimitReserved event
+    AS->>AS: Checkout Lease und FUNDS_RESERVED speichern
+    AS-->>PS: FundsReserved event
+    PS->>PS: Bestand reservieren und STOCK_RESERVED speichern
+    PS-->>AS: StockReserved event
+    AS->>AS: Guthaben belasten und FUNDS_CAPTURED speichern
+    AS-->>LS: FundsCaptured event
+    LS->>LS: Limit abbuchen und LIMIT_CONFIRMED speichern
+    LS-->>PS: LimitConfirmed event
+    PS->>PS: Bestand abbuchen und COMPLETED speichern
+    PS-->>Kunde: SaleCompleted event
+```
+
+### Entscheidungen im Happy Path
+
+- Es gibt keinen Verkaufsservice. Jeder Fachservice reagiert nur auf ein
+  Ereignis und publiziert nach seiner eigenen dauerhaften Änderung das nächste
+  Ereignis.
+- `saleId` ist bei jedem Ereignis enthalten. Dadurch sind doppelte Zustellungen
+  idempotent und führen nicht zu einer zweiten Reservierung oder Buchung.
+- Account Service speichert beim Empfang von `LimitReserved` die Checkout Lease
+  pro Account. Damit können mehrere Tabs keinen parallelen Kauf auslösen.
+- Die Reihenfolge bleibt fachlich gleich: Limit und Guthaben werden reserviert,
+  das Produkt wird verbindlich zugeteilt und erst danach wird Geld belastet.
+
+## Fehlerpfad 1a: Account Service scheitert bei der Guthabenreservierung
+
+### Komponentendiagramm
+
+```mermaid
+flowchart LR
+    LS[Limit Service]
+    AS[Account Service]
+
+    LS -->|1. LimitReserved event| AS
+    AS -->|2. AccountReservationFailed event| LS
+```
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Kunde
+    participant LS as Limit Service
+    participant AS as Account Service
+
+    Kunde->>LS: SaleRequested event
+    LS->>LS: Limit reservieren und LIMIT_RESERVED speichern
+    LS-->>AS: LimitReserved event
+    AS->>AS: reserveFunds Fehler nach 10 ms speichern
+    AS-->>LS: AccountReservationFailed event
+    LS->>LS: Limit freigeben und LIMIT_RELEASED speichern
+    LS-->>Kunde: SaleFailed event
+    AS->>AS: ACCOUNT_RECONCILIATION_PENDING speichern
+    Note right of AS: Account Service ist nicht erreichbar
+    AS->>AS: Nach Recovery eigene Reservierung synchronisieren
+    AS->>AS: Checkout Lease freigeben
+```
+
+### Entscheidungen in Fehlerpfad 1a
+
+- Account Service publiziert das Fehlerereignis; Limit Service reagiert selbst
+  darauf und gibt seine Reservierung frei. Es gibt keinen zentralen
+  Kompensationsaufruf.
+- Account Service hält seine Kompensationsaufgabe dauerhaft. Nach Recovery löst
+  er eine eventuell entstandene Reservierung mit derselben `saleId` auf und
+  publiziert erst dann `AccountReconciled`.
+
+## Fehlerpfad 1b: Account Service scheitert beim Abbuchen
+
+### Komponentendiagramm
+
+```mermaid
+flowchart LR
+    LS[Limit Service]
+    AS[Account Service]
+    PS[Produkt Service]
+
+    LS -->|1. LimitReserved event| AS
+    AS -->|2. FundsReserved event| PS
+    PS -->|3. StockReserved event| AS
+    AS -->|4. AccountCaptureFailed event| PS
+    AS -->|5. AccountCaptureFailed event| LS
+```
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Kunde
+    participant LS as Limit Service
+    participant AS as Account Service
+    participant PS as Produkt Service
+
+    Kunde->>LS: SaleRequested event
+    LS-->>AS: LimitReserved event
+    AS-->>PS: FundsReserved event
+    PS->>PS: Bestand reservieren und STOCK_RESERVED speichern
+    PS-->>AS: StockReserved event
+    AS->>AS: captureFunds Fehler nach 10 ms speichern
+    AS-->>PS: AccountCaptureFailed event
+    AS-->>LS: AccountCaptureFailed event
+    PS->>PS: Bestand freigeben und STOCK_RELEASED speichern
+    LS->>LS: Limit freigeben und LIMIT_RELEASED speichern
+    AS->>AS: ACCOUNT_RECONCILIATION_PENDING speichern
+    AS->>AS: Nach Recovery Guthaben freigeben oder erstatten
+    AS->>AS: Checkout Lease freigeben
+    LS-->>Kunde: SaleFailed event
+```
+
+### Entscheidungen in Fehlerpfad 1b
+
+- Das Fehlerereignis wird an alle betroffenen Services publiziert. Produkt und
+  Limit kompensieren sich unabhängig und parallel.
+- Account Service klärt seine unbekannte Teilwirkung nach Recovery selbst. Je
+  nach Zustand wird Guthaben freigegeben oder eine bereits erfolgte Belastung
+  erstattet.
+
+## Fehlerpfad 2a: Timeout bei der Produktreservierung
+
+### 2a.1 Retry der Produktreservierung ist erfolgreich
+
+```mermaid
+flowchart LR
+    LS[Limit Service]
+    AS[Account Service]
+    PS[Produkt Service]
+
+    LS -->|1. LimitReserved event| AS
+    AS -->|2. FundsReserved event| PS
+    PS -->|3. Verarbeitung Timeout| PS
+    PS -->|4. Gleiche Nachricht erneut verarbeiten| PS
+    PS -->|5. StockReserved event| AS
+```
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant LS as Limit Service
+    participant AS as Account Service
+    participant PS as Produkt Service
+
+    LS-->>AS: LimitReserved event
+    AS->>AS: Guthaben reservieren
+    AS-->>PS: FundsReserved event
+    PS->>PS: reserveStock Verarbeitung Timeout
+    PS->>PS: FundsReserved mit gleicher saleId erneut verarbeiten
+    PS->>PS: Bestand einmalig reservieren und STOCK_RESERVED speichern
+    PS-->>AS: StockReserved event
+    AS-->>LS: FundsCaptured event
+    LS-->>PS: LimitConfirmed event
+```
+
+#### Entscheidung in 2a.1
+
+- Die erneute Zustellung desselben `FundsReserved`-Ereignisses ist erlaubt,
+  weil Product Service anhand der `saleId` genau einmal reserviert.
+- Sobald `StockReserved` publiziert wird, läuft die Choreographie normal weiter.
+
+### 2a.2 Retry der Produktreservierung scheitert erneut
+
+```mermaid
+flowchart LR
+    LS[Limit Service]
+    AS[Account Service]
+    PS[Produkt Service]
+
+    AS -->|1. FundsReserved event| PS
+    PS -->|2. ProductReservationFailed event| AS
+    PS -->|3. ProductReservationFailed event| LS
+    AS -->|4. FundsReleased event| PS
+    LS -->|5. LimitReleased event| PS
+```
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant LS as Limit Service
+    participant AS as Account Service
+    participant PS as Produkt Service
+
+    AS-->>PS: FundsReserved event
+    PS->>PS: Zweiter Verarbeitungsversuch schlaegt fehl
+    PS-->>AS: ProductReservationFailed event
+    PS-->>LS: ProductReservationFailed event
+    AS->>AS: Guthaben freigeben und FUNDS_RELEASED speichern
+    LS->>LS: Limit freigeben und LIMIT_RELEASED speichern
+    AS-->>PS: FundsReleased event
+    LS-->>PS: LimitReleased event
+    PS->>PS: Eigene unklare Reservierung nach Recovery freigeben
+```
+
+#### Entscheidung in 2a.2
+
+- Product Service löst das Fehlerereignis aus. Account und Limit reagieren
+  unabhängig und geben ihre sicher bekannten Reservierungen frei.
+- Product Service verarbeitet die eingehenden Freigabeereignisse idempotent und
+  bereinigt so eine möglicherweise durch den ersten Versuch entstandene
+  Bestandsreservierung.
+
+## Fehlerpfad 2b: Timeout beim endgültigen Abbuchen des Bestands
+
+### 2b.1 Retry des Bestandsabbuchens ist erfolgreich
+
+```mermaid
+flowchart LR
+    AS[Account Service]
+    LS[Limit Service]
+    PS[Produkt Service]
+
+    AS -->|1. FundsCaptured event| LS
+    LS -->|2. LimitConfirmed event| PS
+    PS -->|3. Verarbeitung Timeout| PS
+    PS -->|4. Gleiche Nachricht erneut verarbeiten| PS
+```
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant AS as Account Service
+    participant LS as Limit Service
+    participant PS as Produkt Service
+
+    AS-->>LS: FundsCaptured event
+    LS->>LS: Limit abbuchen und LIMIT_CONFIRMED speichern
+    LS-->>PS: LimitConfirmed event
+    PS->>PS: commitStock Verarbeitung Timeout
+    PS->>PS: LimitConfirmed mit gleicher saleId erneut verarbeiten
+    PS->>PS: Bestand einmalig abbuchen und COMPLETED speichern
+```
+
+#### Entscheidung in 2b.1
+
+- Die erneute Zustellung von `LimitConfirmed` ist sicher, weil `commitStock`
+  mit der `saleId` idempotent ist.
+- Ein bereits verarbeitetes Ereignis liefert nur erneut `SaleCompleted`; der
+  Bestand wird nicht zweimal abgebucht.
+
+### 2b.2 Retry des Bestandsabbuchens scheitert erneut
+
+```mermaid
+flowchart LR
+    AS[Account Service]
+    LS[Limit Service]
+    PS[Produkt Service]
+
+    LS -->|1. LimitConfirmed event| PS
+    PS -->|2. ProductCommitFailed event| AS
+    PS -->|3. ProductCommitFailed event| LS
+    AS -->|4. FundsRefunded event| PS
+    LS -->|5. LimitRolledBack event| PS
+```
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant AS as Account Service
+    participant LS as Limit Service
+    participant PS as Produkt Service
+
+    LS-->>PS: LimitConfirmed event
+    PS->>PS: Zweiter commitStock Versuch schlaegt fehl
+    PS-->>AS: ProductCommitFailed event
+    PS-->>LS: ProductCommitFailed event
+    AS->>AS: Guthaben erstatten und FUNDS_REFUNDED speichern
+    LS->>LS: Limit zurueckrollen und LIMIT_ROLLED_BACK speichern
+    AS-->>PS: FundsRefunded event
+    LS-->>PS: LimitRolledBack event
+    PS->>PS: Unklare Bestandsbuchung nach Recovery bereinigen
+```
+
+#### Entscheidung in 2b.2
+
+- Erst nach dem zweiten fehlgeschlagenen Verarbeitungsversuch publiziert Product
+  Service `ProductCommitFailed`. Dadurch wird nicht versehentlich erstattet,
+  obwohl die erste Bestandsbuchung bereits erfolgreich war.
+- Account und Limit kompensieren ihre endgültigen Buchungen als Reaktion auf das
+  Fehlerereignis. Product Service bereinigt seine unklare Teilwirkung
+  idempotent, sobald sein eigener Zustand wieder verfügbar ist.
