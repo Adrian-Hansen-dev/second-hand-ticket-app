@@ -5,11 +5,11 @@ der Reservierungen und kennt als einziger Service den vollständigen Zustand ein
 Verkaufsvorgangs. `saleId` ist ein vom Client erzeugter Idempotenzschlüssel; jede
 Reservierung und jede Kompensation wird mit derselben `saleId` ausgeführt.
 
-## Komponenten und Aufrufe
+## Happy Path: Komponentendiagramm
 
 ```mermaid
 flowchart LR
-    VS[Verkaufsservice<br/>Orchestrator]
+    VS[Verkaufsservice]
     LS[Limit Service]
     AS[Account Service]
     PS[Produkt Service]
@@ -69,16 +69,147 @@ sequenceDiagram
     Note over VS,PS: Recovery nutzt die gespeicherten Saga und Service Status
 ```
 
-## Designentscheidungen
+### Entscheidungen im Happy Path
 
-- **Saga mit zentraler Orchestrierung:** Der Verkaufsservice entscheidet über den nächsten Schritt und die Kompensation. Das macht den Ablauf, den Recovery-Fall und die Fehlerbehandlung nachvollziehbar, ohne dass die drei Fachservices voneinander abhängig werden.
-- **Ein aktiver Checkout pro Account:** Der Verkaufsservice speichert für jeden Account eine dauerhafte Checkout-Lease mit `saleId` und Status `CHECKOUT_IN_PROGRESS`. Damit kann nur ein Tab desselben Accounts gleichzeitig einkaufen; ein weiterer Tab erhält den laufenden Checkout oder eine passende Fehlermeldung. Die Lease ist keine lange Datenbanktransaktion, sondern ein gespeicherter Zustand mit Ablaufzeit. Sie wird nach Erfolg, Fehler oder Recovery freigegeben. Das reduziert unnötige parallele Anfragen desselben Accounts, ohne bei einem Absturz dauerhaft zu blockieren.
-- **Tabs pruefen unverbindlich, Checkout reserviert verbindlich:** Eine Verfügbarkeitsanzeige im Warenkorb erzeugt keine Reservierung. Erst beim Checkout werden Limit, Guthaben und Bestand verbindlich reserviert. Deshalb gewinnt die erste erfolgreich verarbeitete Checkout-Anfrage; ein späterer Checkout wird abgelehnt, wenn Limit, Guthaben oder Bestand nicht mehr ausreichen. Ein später geöffneter Tab kann keine erfolgreiche Reservierung eines anderen Tabs ersetzen.
-- **Reihenfolge Limit -> Konto -> Produkt:** Das Tageslimit wird zuerst reserviert, weil es rechtlich relevant ist und vor jedem Verkauf sicher eingehalten werden muss. Danach wird das vorhandene Guthaben nur reserviert, aber noch nicht abgebucht. Anschließend reserviert der Produkt Service den Bestand. Erst wenn alle drei Reservierungen erfolgreich sind, werden die endgültigen Buchungen ausgeführt.
-- **Produktvergabe und Abbuchung:** `reserveStock` ist die verbindliche Zusage des Produkts an den Kunden. Die erste Anfrage, die der Produkt Service atomar akzeptiert, gewinnt; maßgeblich ist die Reihenfolge am Produkt Service, nicht der lokale Klickzeitpunkt im Browser. Erst nach dieser Produktbestätigung ruft der Verkaufsservice `captureFunds` auf und bucht das Geld tatsächlich ab. Davor ist das Guthaben nur reserviert. So wird niemand belastet, bevor das Produkt für ihn gesichert ist. Schlägt die Abbuchung fehl, werden Produkt- und Limitreservierung wieder freigegeben.
-- **Limit Service trotz Checkout-Lease robust halten:** Beim Checkout erhält der Limit Service zusätzlich kurzzeitig einen pessimistischen Lock für genau einen `(customerId, tag)`-Datensatz. Er reserviert nur dann, wenn das verbleibende Tageslimit ausreicht. Das schützt auch gegen parallele Retries, doppelte Requests oder direkte Aufrufe, die die Checkout-Lease umgehen könnten.
-- **Unterschiedliche Nebenläufigkeitsstrategie:** Der Account Service reserviert das Guthaben atomar und idempotent; reicht das verfügbare Guthaben nach einer anderen erfolgreichen Reservierung nicht mehr aus, schlägt die spätere Anfrage fehl. Der Produkt Service nutzt optimistische Nebenläufigkeit: Das Update enthält die gelesene `version` und die Bedingung `stock - reserved >= menge`. Bei einem Versionskonflikt wird neu gelesen; reicht der Bestand dann nicht mehr, schlägt dieser Kauf fehl. Alle drei Services folgen damit dem gleichen Geschäftsverhalten: Die erste erfolgreiche Checkout-Reservierung gewinnt. Die technische Umsetzung ist je Service unterschiedlich.
-- **Dauerhafte Zustände:** Der Orchestrator speichert jeden Saga-Schritt in der Verkaufs-DB. Jeder Fachservice speichert seinen Reservierungs- bzw. Abschlussstatus zusammen mit der Änderung der fachlichen Daten. Dadurch kann ein Absturz keine bereits ausgeführte Reservierung unsichtbar machen.
-- **Kompensation bei fachlichem Fehler:** Liefert der Account Service den nicht wiederholbaren Fehler, markiert der Verkaufsservice die Saga als `COMPENSATING`, ruft `releaseLimit(saleId)` auf und beendet sie als `FAILED`. Falls die Produktreservierung fachlich scheitert, werden `releaseFunds(saleId)` und danach `releaseLimit(saleId)` ausgeführt. Eine nicht abgeschlossene Saga verbraucht somit weder Limit noch Guthaben dauerhaft.
-- **Timeout am Produkt Service:** Ein Timeout bedeutet ein unbekanntes Ergebnis, nicht automatisch einen Fehlschlag. Der Verkaufsservice fragt daher zuerst `getReservationStatus(saleId)` ab oder wiederholt `reserveStock` mit derselben `saleId`. Nur ein bestätigtes `NOT_RESERVED` bzw. ein definierter Ablauf der Reservierung löst die Kompensation aus. Bei einem bestätigten `RESERVED` wird die Saga normal fortgesetzt.
-- **Finalisierung und Recovery:** `confirmLimit`, `captureFunds` und `commitStock` sind ebenfalls idempotent. Scheitert der Orchestrator während der Finalisierung, rekonstruiert er die Saga aus der Verkaufs-DB und den Service-Statusdaten und wiederholt nur die noch offenen Aufrufe. Reservierungen erhalten zusätzlich eine Ablaufzeit; ein Recovery-Job klärt abgelaufene, nicht terminale Sagas anhand der gespeicherten `saleId`.
+- **Ein Checkout pro Account:** Der Verkaufsservice hält eine gespeicherte
+  Checkout-Lease mit `saleId`. Ein zweiter Tab kann deshalb keinen parallelen
+  Kauf starten; die Lease wird nach Abschluss, Fehler oder Ablauf freigegeben.
+- **Verbindliche Reservierungen erst beim Checkout:** Eine Warenkorbprüfung ist
+  unverbindlich. Beim Checkout reserviert der Limit Service zuerst unter einem
+  kurzen Lock; danach reservieren Account und Produkt atomar. Damit gewinnt die
+  erste erfolgreich verarbeitete Anfrage, ohne das Limit, Guthaben oder den
+  Bestand zu überschreiten.
+- **Produkt vor Abbuchung:** `reserveStock` sichert das Produkt für den Kunden.
+  Erst danach wird Guthaben belastet; Limit und Bestand werden anschließend
+  endgültig gebucht. Jeder Schritt und seine Antwort werden als Saga-Status
+  gespeichert, damit ein Neustart den Ablauf fortsetzen kann.
+
+## Fehlerpfad 1a: Account Service scheitert bei der Guthabenreservierung
+
+Der Account Service liefert nach 10 ms einen nicht wiederholbaren Fehler bei
+`reserveFunds`. Der ursprüngliche Aufruf wird nicht wiederholt, weil unklar ist,
+ob der Service die Reservierung kurz vor dem Fehler bereits gespeichert hat.
+
+### Komponentendiagramm
+
+```mermaid
+flowchart LR
+    VS[Verkaufsservice]
+    LS[Limit Service]
+    AS[Account Service]
+
+    VS -->|1. Limit reservieren| LS
+    VS -->|2. Guthaben reservieren Fehler| AS
+    VS -->|3. Limit freigeben| LS
+    VS -->|4. Kompensation synchronisieren nach Recovery| AS
+```
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant VS as Verkaufsservice
+    participant LS as Limit Service
+    participant AS as Account Service
+    participant PS as Produkt Service
+
+    VS->>LS: reserveLimit(saleId)
+    LS-->>VS: RESERVED
+    VS->>VS: Saga LIMIT_RESERVED speichern
+
+    VS->>AS: reserveFunds(saleId)
+    AS-->>VS: ERROR nach 10 ms ohne Retry
+    VS->>VS: Saga COMPENSATING speichern
+    VS->>LS: releaseLimit(saleId)
+    LS-->>VS: RELEASED
+    VS->>VS: Limit kompensiert speichern
+    VS->>VS: ACCOUNT_RECONCILIATION_PENDING speichern
+    Note right of AS: Service ist nicht erreichbar
+    VS->>AS: healthCheck bis Service wieder verfuegbar ist
+    AS-->>VS: AVAILABLE
+    VS->>AS: synchronizeCompensation(saleId)
+    AS-->>VS: RELEASED oder NOT_RESERVED
+    Note right of AS: Status FUNDS_RELEASED oder NOT_RESERVED speichern
+    VS->>VS: Saga FAILED speichern und Lease freigeben
+```
+
+### Entscheidungen in Fehlerpfad 1a
+
+- Die Limitreservierung wird sofort freigegeben, weil ihr Erfolg sicher bekannt
+  ist.
+- `reserveFunds` wird nicht wiederholt. Stattdessen wird
+  `ACCOUNT_RECONCILIATION_PENDING` gespeichert, damit die Kompensation nicht bei
+  einem Absturz verloren geht.
+- Erst wenn Account Service wieder verfügbar ist, synchronisiert
+  `synchronizeCompensation(saleId)` die möglicherweise entstandene Reservierung
+  zu `FUNDS_RELEASED` oder `NOT_RESERVED`.
+
+## Fehlerpfad 1b: Account Service scheitert beim Abbuchen
+
+Hier waren Limit, Guthaben und Produkt bereits reserviert. Der Fehler bei
+`captureFunds` bedeutet deshalb, dass alle drei Reservierungen kompensiert werden
+müssen.
+
+### Komponentendiagramm
+
+```mermaid
+flowchart LR
+    VS[Verkaufsservice]
+    LS[Limit Service]
+    AS[Account Service]
+    PS[Produkt Service]
+
+    VS -->|1. Limit reservieren| LS
+    VS -->|2. Guthaben reservieren| AS
+    VS -->|3. Produkt reservieren| PS
+    VS -->|4. Konto belasten Fehler| AS
+    VS -->|5. Produkt freigeben| PS
+    VS -->|6. Limit freigeben| LS
+    VS -->|7. Kompensation synchronisieren nach Recovery| AS
+```
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant VS as Verkaufsservice
+    participant LS as Limit Service
+    participant AS as Account Service
+    participant PS as Produkt Service
+
+    VS->>LS: reserveLimit(saleId)
+    LS-->>VS: RESERVED
+    VS->>VS: Saga LIMIT_RESERVED speichern
+    VS->>AS: reserveFunds(saleId)
+    AS-->>VS: RESERVED
+    VS->>VS: Saga FUNDS_RESERVED speichern
+    VS->>PS: reserveStock(saleId)
+    PS-->>VS: RESERVED
+    VS->>VS: Saga STOCK_RESERVED speichern
+
+    VS->>AS: captureFunds(saleId)
+    AS-->>VS: ERROR nach 10 ms ohne Retry
+    VS->>VS: Saga COMPENSATING speichern
+    VS->>PS: releaseStock(saleId)
+    PS-->>VS: RELEASED
+    VS->>LS: releaseLimit(saleId)
+    LS-->>VS: RELEASED
+    VS->>VS: ACCOUNT_RECONCILIATION_PENDING speichern
+    Note right of AS: Service ist nicht erreichbar
+    VS->>AS: healthCheck bis Service wieder verfuegbar ist
+    AS-->>VS: AVAILABLE
+    VS->>AS: synchronizeCompensation(saleId)
+    AS-->>VS: RELEASED oder REFUNDED
+    Note right of AS: Status FUNDS_RELEASED oder FUNDS_REFUNDED speichern
+    VS->>VS: Saga FAILED speichern und Lease freigeben
+```
+
+### Entscheidungen in Fehlerpfad 1b
+
+- Produkt und Limit werden sofort freigegeben, weil beide Services erreichbar
+  sind und ihre Reservierungen sicher bekannt sind.
+- Für Account wird `ACCOUNT_RECONCILIATION_PENDING` gespeichert. So lange der
+  Service down ist, bleibt die Kompensation bestehen und der ursprüngliche
+  Abbuchungsaufruf wird nicht wiederholt.
+- Nach Recovery führt `synchronizeCompensation(saleId)` zu `FUNDS_RELEASED`.
+  Falls die Belastung vor dem Fehler schon erfolgt war, wird stattdessen
+  `FUNDS_REFUNDED` gespeichert. Erst danach wird die Saga endgültig als
+  `FAILED` abgeschlossen und die Lease freigegeben.
