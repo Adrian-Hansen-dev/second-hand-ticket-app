@@ -9,7 +9,7 @@ Diese Spezifikation beschreibt die Systemoperationen nach dem Assemblage-Ansatz.
 | `User` | Benutzerkonto und Benutzerstatus | UserId, Benutzername, Vorname, Nachname, Geburtsdatum, E-Mail, Kundennummer (Betreff für Einzahlungen), IBAN, Credentials, Rolle (User / Admin / Accounting), Status |
 | `TicketOffer` | Zum Verkauf angebotenes Ticket | TicketId, SellerId, Start, End, ValidFrom, ValidUntil, Provider, Price, OriginalPrice, Status |
 | `Purchase` | Kaufvorgang zwischen Käufer und Verkäufer | PurchaseId, TicketId, BuyerId, SellerId, AgreedPrice, BuyerAccepted, SellerAccepted, Status |
-| `Conversation` | Kommunikation zwischen Käufer und Verkäufer (bei Admin-Nachfrage auch Admin) | ConversationId, Participants, Messages |
+| `Conversation` | Kommunikation zwischen Käufer und Verkäufer | ConversationId, Participants, Messages |
 | `BalanceAccount` | Guthabenkonto eines Benutzers | UserId, AvailableBalance, ReservedBalance, Transactions |
 | `Withdrawal` | Auszahlungsanforderung | WithdrawalId, UserId, Amount, Status |
 | `Cancellation` | Stornoantrag eines Käufers | CancellationId, PurchaseId, Reason, SellerResponse, Status, Deadline |
@@ -231,7 +231,7 @@ stateDiagram-v2
 - Schreibt: `Purchase`, `TicketOffer`, `BalanceAccount`.
 - Speichert die Zustimmung der aufrufenden Kaufpartei.
 - ⚠ Annahme: Der im Chat vereinbarte Preis wird als `AgreedPrice` im `Purchase` festgehalten; beide Zustimmungen beziehen sich auf denselben Preis. Wie der Preis übergeben wird, ist offen.
-- ⚠ Annahme: Das Verhalten bei unzureichendem Guthaben des Käufers ist offen.
+- Reicht das Guthaben des Käufers nicht, wird der Kauf kompensiert: Ticket wieder `Available`, Kauf zurück auf `Pending`, beide Parteien werden benachrichtigt (→ ADR-012).
 - Sobald Käufer und Verkäufer zugestimmt haben, wird der Kaufbetrag (`AgreedPrice`) beim Käufer belastet oder reserviert, das Ticket als `Reserved` markiert und der Kaufstatus aktualisiert.
 
 **Nichtfunktionale Anforderungen**
@@ -328,6 +328,7 @@ stateDiagram-v2
 - Liest: `Purchase`, `User`, `Rating`.
 - Schreibt: `Rating`.
 - Prüft die gemeinsame Beteiligung am Kaufvorgang, speichert die Bewertung und macht sie öffentlich sichtbar.
+- Bewerten dürfen nur Käufer und Verkäufer eines abgeschlossenen Kaufs (`Completed`), je Beteiligtem einmal pro Kauf (→ ADR-009).
 
 **Nichtfunktionale Anforderungen**
 
@@ -412,9 +413,9 @@ stateDiagram-v2
 **Verhalten**
 
 - Liest: `Purchase`, `User`.
-- Schreibt: `Conversation`.
+- Schreibt: keine fachlichen Aggregates.
 - Prüft, dass der Kauf noch nicht abgeschlossen ist, und fordert beim Verkäufer eine Auskunft zur Ticketübergabe an.
-- Die Anfrage wird als Nachricht des Admins der bestehenden `Conversation` des Kaufs hinzugefügt; existiert keine, wird sie angelegt. Der Admin wird dabei Teilnehmer.
+- Die Anfrage geht in Iteration 1 per E-Mail an den Verkäufer: Die Operation publiziert ein Event, der Notification Service versendet die E-Mail (→ ADR-029). Der Admin ist kein Chat-Teilnehmer.
 
 **Nichtfunktionale Anforderungen**
 
@@ -753,7 +754,7 @@ Berechtigungsprüfungen (L) nutzen die beim Login ausgestellte Identität und z�
 | 14 | `expireCancellationDeadline()` | | (S) | L (S) | | (S) | S | | | 2–4 | übergreifend |
 | 15 | `requestTicketRelisting()` | | S | S | | S | S | | | 4 | übergreifend |
 | 16 | `approveCancellation()` | | S | S | | S | S | | E | 4 | übergreifend |
-| 17 | `requestTicketReceivalStatus()` | L | | L | S | | | | | 3 | übergreifend |
+| 17 | `requestTicketReceivalStatus()` | L | | L | | | | | E | 2 | übergreifend |
 | 18 | `blockUser()` | S | | | | | L | | | 2 | übergreifend |
 | 19 | `withdrawTicketOffer()` | | S | S | | | | | E | 2 | übergreifend |
 | 20 | `updateTicketOffer()` | | S | | | | | | | 1 | lokal |
@@ -768,7 +769,7 @@ Berechtigungsprüfungen (L) nutzen die beim Login ausgestellte Identität und z�
 | 29 | `viewPendingWithdrawals()` | L | | | | L | | | | 2 | übergreifend |
 | 30 | `findUserByCustomerNumber()` | L | | | | | | | | 1 | lokal |
 
-`requestTicketReceivalStatus()` schreibt in die `Conversation` des Kaufs (Teamentscheidung, siehe Offene Architekturentscheidungen).
+`requestTicketReceivalStatus()` schreibt nicht in die `Conversation`, sondern löst eine E-Mail über Notification aus (→ ADR-029).
 
 **Ergebnis:** 17 von 30 Operationen sind subdomänenübergreifend (14 Kommandos, 3 Abfragen). Sie werden in Schritt 3 verteilt, sobald ihre Subdomänen in verschiedenen Services liegen, und brauchen dann ein Kollaborationsmuster (Saga, API Composition, CQRS). Kritisch sind `acceptOffer()`, `confirmTicketReceival()`, `requestTicketRelisting()` und `approveCancellation()`: Sie schreiben drei bis vier Subdomänen, darunter Balance.
 
@@ -794,7 +795,7 @@ Die Architektur startet leer. Operationen werden in der Reihenfolge des Rankings
 **Fortschritt**
 
 - [x] 1 `createTicketOffer()` – ADR-015
-- [ ] 2 `searchTicket()`
+- [x] 2 `searchTicket()` – ADR-023 (Vorschlag, wartet auf Freigabe)
 - [ ] 3 `expressPurchaseInterest()`
 - [ ] 4 `acceptOffer()`
 - [ ] 5 `confirmTicketReceival()`
@@ -865,6 +866,52 @@ sequenceDiagram
     Gateway-->>Verkäufer: TicketId
 ```
 
+### Realisierung: `searchTicket()` (Rang 2)
+
+**Subdomänen:** Ticket Management (bereits Ticket Service). Keine Subdomäne ist frei, es gibt nichts zuzuweisen; die Kandidaten unterscheiden sich nur in der Kollaboration.
+
+**Kandidaten**
+
+| # | Zuweisung | lokal/verteilt | Kollaboration |
+| --- | --- | --- | --- |
+| 1 | keine Änderung | lokal | API Gateway leitet an den Ticket Service weiter; dieser sucht direkt in seinen `TicketOffer`-Daten. |
+| 2 | keine Änderung; zusätzlicher **Search Service** mit eigener Lesesicht (CQRS) | lokal zur Laufzeit | Ticket Service publiziert bei jeder Änderung eines Angebots ein Event (`TicketOfferCreated`, `…Reserved`, `…Withdrawn`, `…Expired`); der Search Service aktualisiert seine Lesesicht und beantwortet die Suche. |
+
+**Bewertung**
+
+| Kraft | #1 | #2 |
+| --- | --- | --- |
+| Simple components | ✅ alles in einem Service | ⚠ zusätzlicher Service mit Projektionslogik |
+| Team autonomy | ✅ Team Marktplatz | ✅ Team Marktplatz, beide Services |
+| Fast deployment pipeline | ✅ | ✅ |
+| Support multiple technology stacks | ⚠ Suche und Schreiben teilen sich eine Datenhaltung | ✅ suchoptimierte Datenhaltung frei wählbar |
+| Segregate by characteristics | ⚠ hohe Leselast und Schreibzugriffe skalieren gemeinsam | ✅ Suche skaliert unabhängig |
+| Simple interactions | ✅ keine | ⚠ Event je Statusänderung eines Angebots |
+| Efficient interactions | ✅ ein Aufruf | ✅ ein Aufruf; Events laufen im Hintergrund |
+| Prefer ACID over BASE | ✅ Suche sieht immer den aktuellen Stand | ⚠ Lesesicht kurz veraltet (eben reservierte Tickets noch sichtbar) |
+| Minimize runtime coupling | ✅ keine | ✅ keine |
+| Minimize design-time coupling | ✅ keine | ⚠ Event-Schema von `TicketOffer` bindet den Search Service |
+| Treiber: Verfügbarkeit | ⚠ Suche fällt mit dem Ticket Service aus | ✅ Suche bleibt bei Ausfall des Ticket Service verfügbar |
+| Treiber: Usability | ✅ immer aktuelle Treffer | ⚠ kurzzeitig veraltete Treffer |
+
+**Entscheidung:** Kandidat #1 (Vorschlag → ADR-023). #2 gewinnt beim Treiber Verfügbarkeit, aber der Vorteil ist klein: Ohne Ticket Service kann ohnehin kein Kauf beginnen (`expressPurchaseInterest()` prüft dort die Verfügbarkeit), und der Ticket Service lässt sich auch als Ganzes mehrfach betreiben. Dafür kostet #2 einen weiteren Service, Events und veraltete Treffer. Die hohe Leselast wird in Schritt 4 als möglicher Smell geprüft; CQRS bleibt dort die Option.
+
+**Änderungen an der Architektur:** API Gateway: Route `searchTicket()` → Ticket Service · Ticket Service: Operation `searchTicket()` ergänzt, Aufrufer Käufer
+
+```mermaid
+sequenceDiagram
+    actor Käufer
+    participant Gateway as API Gateway
+    participant TicketService as Ticket Service
+
+    Käufer->>Gateway: searchTicket(start, end, travelDate, provider)
+    Gateway->>Gateway: Identität aus dem Login prüfen
+    Gateway->>TicketService: searchTicket(start, end, travelDate, provider)
+    TicketService->>TicketService: verfügbare, gültige Angebote filtern
+    TicketService-->>Gateway: List<TicketOffer>
+    Gateway-->>Käufer: Trefferliste
+```
+
 ## Service-Architektur (aktueller Stand)
 
 **API Gateway** – authentifiziert Anfragen über die Identität aus dem Login (ADR-014), drosselt Fehlversuche beim Login (ADR-011) und leitet weiter.
@@ -872,6 +919,7 @@ sequenceDiagram
 | Operation | Ziel-Service |
 | --- | --- |
 | `createTicketOffer()` | Ticket Service |
+| `searchTicket()` | Ticket Service |
 
 **Ticket Service**
 
@@ -879,10 +927,10 @@ sequenceDiagram
 | --- | --- |
 | Subdomänen | Ticket Management |
 | Persistente Aggregates | `TicketOffer` («persistent») |
-| Angebotene Operationen | `createTicketOffer()` |
+| Angebotene Operationen | `createTicketOffer()`, `searchTicket()` |
 | Publizierte Events | – |
 | Behandelte Events | – |
-| Aufrufer | Verkäufer (User) über API Gateway |
+| Aufrufer | Verkäufer und Käufer (User) über API Gateway |
 
 ## Offene Architekturentscheidungen
 
@@ -894,9 +942,9 @@ sequenceDiagram
 | Ticket-Relisting | Darf der Verkäufer das Ticket sofort erneut anbieten oder nur unter bestimmten Bedingungen? |
 | Guthaben | Wird Geld beim Kauf sofort abgebucht oder zunächst reserviert? |
 | Accounting | Wie wird eine manuelle Auszahlung als abgeschlossen dokumentiert, ohne das Guthaben doppelt zu belasten? |
-| Bewertungen | Darf jeder Benutzer bewerten oder nur nach einem abgeschlossenen Kauf? |
+| Bewertungen | → ADR-009 |
 | Preis | Wie wird der im Chat vereinbarte Preis verbindlich als `AgreedPrice` im `Purchase` festgehalten (Parameter von `acceptOffer()` oder eigene Operation)? |
-| Kaufabschluss | Was passiert bei `acceptOffer()`, wenn das Guthaben des Käufers nicht ausreicht (Ablehnung, Zustimmung bleibt offen bis Einzahlung, …)? |
+| Kaufabschluss | → ADR-012 |
 | Ticket-Gültigkeit | Was passiert mit einem Kauf im Status `Accepted`, wenn `ValidUntil` des Tickets abläuft (`expireTicketOffer()`)? |
 | Angebotsverwaltung | Darf ein Angebot mit offenen `Pending`-Käufen bearbeitet oder zurückgezogen werden? |
 | Statusmodelle | Sind die ergänzten Statuswerte (`Sold`, `Withdrawn`, `Expired`, `SellerConfirmed`, `Disputed`, `Requested`) und Übergänge korrekt? |
@@ -904,7 +952,7 @@ sequenceDiagram
 | Login | → ADR-011 |
 | Ranking | ✔ Entschieden (Team): `confirmTicketReceival()` bleibt auf Rang 5. |
 | Berechtigungsprüfung | → ADR-014 |
-| Admin-Nachfrage | ✔ Entschieden (Team): `requestTicketReceivalStatus()` schreibt in die `Conversation` des Kaufs und legt sie bei Bedarf an. |
+| Admin-Nachfrage | → ADR-029 (E-Mail über Notification; ersetzt die frühere Teamentscheidung „Conversation") |
 | Subdomänen-Charakteristika | ✔ Entschieden (Team): Teamzuschnitt Plattform, Marktplatz, Zahlungen, Interaktion bestätigt; bleibt gegenüber dem Brief eine Annahme. |
 
 Besonders für Auszahlungen muss das Auflösen einer zuvor angelegten Reservierung definiert werden. Andernfalls besteht das Risiko, dass bei einer späteren negativen `updateBalance()`-Buchung derselbe Betrag doppelt abgezogen wird.
