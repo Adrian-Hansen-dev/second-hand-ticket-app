@@ -15,6 +15,28 @@ werden. So sind Zustellung, Retry und Recovery nachvollziehbar, ohne eine
 Datenbank oder ein konkretes Messaging-System als zusätzlichen Teilnehmer in
 den Diagrammen zu zeigen.
 
+## Architektureinordnung
+
+Der Ablauf ist **keine verteilte ACID-Transaktion und kein 2PC**, sondern eine
+Saga: Jeder Service führt seine Änderung als lokale, atomare Transaktion aus.
+Über Servicegrenzen hinweg wird eine vorübergehende Inkonsistenz akzeptiert und
+im Fehlerfall mit einer expliziten Kompensation aufgelöst. Es gibt kein
+gemeinsames Datenbankschema.
+
+| Bounded Context / Service | Eigene Datenhoheit | Schreiboperationen |
+| --- | --- | --- |
+| Verkaufsservice (nur Orchestrierung) | Saga-Status und Checkout-Lease | `startSale`, `cancelSale` |
+| Limit Service | Tageslimit und Limitreservierungen | `reserveLimit`, `confirmLimit`, `rollbackLimit` |
+| Account Service | Guthaben, Geldreservierungen und Account-Lease | `reserveFunds`, `captureFunds`, `refundFunds` |
+| Produkt Service | Bestand und Bestandsreservierungen | `reserveStock`, `commitStock`, `releaseStock` |
+
+Die Schreiboperationen sind Commands. Statusabfragen wie
+`getCommitStatus(saleId)` sind Queries und verändern keinen Zustand. Jeder
+Command enthält `saleId`; damit sind Wiederholungen idempotent. Im synchronen
+Orchestrierungsfall haben alle Aufrufe ein Timeout und erfolgen nur bei
+temporären, als wiederholbar klassifizierten Fehlern erneut. Ein nicht
+wiederholbarer Fehler löst dagegen die Kompensation aus.
+
 ## Happy Path: Komponentendiagramm
 
 ```mermaid
@@ -498,7 +520,7 @@ sequenceDiagram
     participant AS as Account Service
     participant PS as Produkt Service
 
-    Kunde->>LS: SaleRequested event
+    Kunde->>LS: startSale Command (saleId, customerId, productId, menge, betrag)
     LS->>LS: Limit reservieren und LIMIT_RESERVED speichern
     LS-->>AS: LimitReserved event
     AS->>AS: Checkout Lease und FUNDS_RESERVED speichern
@@ -510,7 +532,7 @@ sequenceDiagram
     LS->>LS: Limit abbuchen und LIMIT_CONFIRMED speichern
     LS-->>PS: LimitConfirmed event
     PS->>PS: Bestand abbuchen und COMPLETED speichern
-    PS-->>Kunde: SaleCompleted event
+    PS-->>Kunde: SaleCompleted Benachrichtigung
 ```
 
 ### Entscheidungen im Happy Path
@@ -524,6 +546,11 @@ sequenceDiagram
   pro Account. Damit können mehrere Tabs keinen parallelen Kauf auslösen.
 - Die Reihenfolge bleibt fachlich gleich: Limit und Guthaben werden reserviert,
   das Produkt wird verbindlich zugeteilt und erst danach wird Geld belastet.
+- Die `... event`-Pfeile sind asynchrone Nachrichten über einen abstrakten
+  Event-Kanal. Jedes Event enthält mindestens `messageId`, `saleId`,
+  Ereignistyp, Version und Zeitstempel. Empfänger verarbeiten ein Event nur
+  dann, wenn die Zustandsänderung für diese `saleId` noch gültig ist; Duplikate
+  und verspätete Events bleiben damit wirkungslos.
 
 ## Fehlerpfad 1a: Account Service scheitert bei der Guthabenreservierung
 
@@ -545,7 +572,7 @@ sequenceDiagram
     participant LS as Limit Service
     participant AS as Account Service
 
-    Kunde->>LS: SaleRequested event
+    Kunde->>LS: startSale Command (saleId)
     LS->>LS: Limit reservieren und LIMIT_RESERVED speichern
     LS-->>AS: LimitReserved event
     AS->>AS: reserveFunds Fehler nach 10 ms speichern
@@ -592,7 +619,7 @@ sequenceDiagram
     participant AS as Account Service
     participant PS as Produkt Service
 
-    Kunde->>LS: SaleRequested event
+    Kunde->>LS: startSale Command (saleId)
     LS-->>AS: LimitReserved event
     AS-->>PS: FundsReserved event
     PS->>PS: Bestand reservieren und STOCK_RESERVED speichern
