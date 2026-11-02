@@ -107,11 +107,14 @@ sequenceDiagram
   Checkout-Lease mit `saleId`. Ein zweiter Tab kann deshalb keinen parallelen
   Kauf starten; die Lease wird nach Abschluss, Fehler oder Ablauf freigegeben.
 
-- **Verbindliche Reservierungen erst beim Checkout:** Eine Warenkorbprüfung ist
-  unverbindlich. Beim Checkout reserviert der Limit Service zuerst unter einem
-  kurzen Lock; danach reservieren Account und Produkt atomar. Damit gewinnt die
-  erste erfolgreich verarbeitete Anfrage, ohne das Limit, Guthaben oder den
-  Bestand zu überschreiten.
+- **Verbindliche Reservierungen und Nebenläufigkeit:** Eine Warenkorbprüfung ist
+  unverbindlich. Gegen Race Conditions bei parallelen Anfragen greifen gezielte Mechanismen:
+  - *Limit Service (Pessimistisches Locking):* Verwendet ein kurzes Zeilen-Lock
+    (`SELECT ... FOR UPDATE`), um parallele Abfragen desselben Kunden strikt zu serialisieren.
+  - *Account & Produkt Service (Atomare Reservierung):* Statt getrenntem Lesen und Prüfen
+    im Code erfolgt die Reservierung direkt als bedingtes atomares SQL-Update
+    (`WHERE balance/stock >= betrag/menge`). Prüfung und Buchung bilden so einen unteilbaren
+    Schritt – die erste Anfrage gewinnt, Überziehungen oder Überverkäufe sind ausgeschlossen.
 
 - **Produkt vor Abbuchung:** `reserveStock` sichert das Produkt für den Kunden.
   Erst danach wird Guthaben belastet; Limit und Bestand werden anschließend
