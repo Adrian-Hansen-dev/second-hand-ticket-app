@@ -106,15 +106,31 @@ sequenceDiagram
 - **Ein Checkout pro Account:** Der Verkaufsservice hält eine gespeicherte
   Checkout-Lease mit `saleId`. Ein zweiter Tab kann deshalb keinen parallelen
   Kauf starten; die Lease wird nach Abschluss, Fehler oder Ablauf freigegeben.
+
 - **Verbindliche Reservierungen erst beim Checkout:** Eine Warenkorbprüfung ist
   unverbindlich. Beim Checkout reserviert der Limit Service zuerst unter einem
   kurzen Lock; danach reservieren Account und Produkt atomar. Damit gewinnt die
   erste erfolgreich verarbeitete Anfrage, ohne das Limit, Guthaben oder den
   Bestand zu überschreiten.
+
 - **Produkt vor Abbuchung:** `reserveStock` sichert das Produkt für den Kunden.
   Erst danach wird Guthaben belastet; Limit und Bestand werden anschließend
   endgültig gebucht. Jeder Schritt und seine Antwort werden als Saga-Status
   gespeichert, damit ein Neustart den Ablauf fortsetzen kann.
+
+- **2-Phasen-Muster**
+    Um die Kernanforderung zu erfüllen, dass nicht abgeschlossene Verkäufe niemals dauerhaft Limit oder Guthaben verbrauchen, ist der Ablauf strikt in zwei Phasen unterteilt:
+  1. *Reservierungsphase:* Alle Ressourcen werden vorab blockiert, aber noch nicht final gebucht. Ein Scheitern in dieser Phase erfordert lediglich ein einfaches Freigeben der Reservierungen ohne buchhalterische Stornos.
+  2. *Bestätigungsphase:* Erst wenn alle drei Vorbedingungen erfüllt sind, werden Guthaben belastet, Limit fixiert und der Lagerabgang gebucht.
+
+- **Reihenfolge der Schritte:**
+  1. *Limit Service:* Das 200-€-Tageslimit ist eine harte **rechtliche** Vorgabe zur Unterbindung von Großhandel. Es ist die schnellste und ressourcenschonendste Prüfung und weist unberechtigte Anfragen sofort ab, bevor nachgelagerte Services belastet werden.
+  2. *Account Service:* Prüft die Zahlungsfähigkeit des Kunden (-> weil Konto nicht überziehbar). Ohne Deckung ist der Kauf ungültig.
+  3. *Produkt Service:* "Bei besonders beliebten Produkten versuchen oft mehrere Kunden zeitgleich hohe Stückzahlen einzukaufen" -> Indem Bestände erst als *letzte* Vorbedingung reserviert werden, wird vermieden, dass Kunden ohne ausreichendes Limit oder Guthaben knappe Lagerbestände für andere Kunden blockieren.
+  4. *Abbuchungsreihenfolge (Schritte 4–6):* `captureFunds` erfolgt vor `commitStock`, damit gesichert ist, dass das Geld eingezogen wurde, bevor die Ware endgültig das Lager verlässt.
+
+- **TODO: Point of no return wird nicht beschrieben**
+
 
 ## Fehlerpfad 1a: Account Service scheitert bei der Guthabenreservierung
 
