@@ -48,12 +48,12 @@ gemeinsames Datenbankschema.
 | Bounded Context / Service | Eigene Datenhoheit | Schreiboperationen |
 | --- | --- | --- |
 | Verkaufsservice (nur Orchestrierung) | Saga-Status und Checkout-Lease | `startSale`, `cancelSale` |
-| Limit Service | Tageslimit und Limitreservierungen | `reserveLimit`, `confirmLimit`, `rollbackLimit` |
-| Account Service | Guthaben, Geldreservierungen und Account-Lease | `reserveFunds`, `captureFunds`, `refundFunds` |
+| Limit Service | Tageslimit und Limitreservierungen | `reserveLimit`, `confirmLimit`, `releaseLimit` (Kompensation vor dem Point of no Return), `rollbackLimit` (nur manueller Storno) |
+| Account Service | Guthaben, Geldreservierungen und Account-Lease | `reserveFunds`, `captureFunds`, `releaseFunds` (Kompensation vor dem Point of no Return), `refundFunds` (nur manueller Storno) |
 | Produkt Service | Bestand und Bestandsreservierungen | `reserveStock`, `commitStock`, `releaseStock` |
 
 Die Schreiboperationen sind Commands. Statusabfragen wie
-`getCommitStatus(saleId)` sind Queries und verändern keinen Zustand. Jeder
+`getFundsStatus(saleId)`, `getCommitStatus(saleId)` und `getSaleStatus(saleId)` sind Queries und verändern keinen Zustand. Jeder
 Command enthält `saleId`; damit sind Wiederholungen idempotent. Im synchronen
 Orchestrierungsfall haben alle Aufrufe ein Timeout und erfolgen nur bei
 temporären, als wiederholbar klassifizierten Fehlern erneut. Ein nicht
@@ -145,7 +145,8 @@ sequenceDiagram
 - **Produkt vor Abbuchung:** `reserveStock` sichert das Produkt für den Kunden.
   Erst danach wird Guthaben belastet; Limit und Bestand werden anschließend
   endgültig gebucht. Jeder Schritt und seine Antwort werden als Saga-Status
-  gespeichert, damit ein Neustart den Ablauf fortsetzen kann.
+  gespeichert, damit ein Neustart den Ablauf fortsetzen oder kompensieren kann
+  (siehe [Recovery](#recovery-nach-einem-absturz)).
 
 - **2-Phasen-Muster**
     Um die Kernanforderung zu erfüllen, dass nicht abgeschlossene Verkäufe niemals dauerhaft Limit oder Guthaben verbrauchen, ist der Ablauf strikt in zwei Phasen unterteilt:
@@ -158,7 +159,36 @@ sequenceDiagram
   3. *Produkt Service:* "Bei besonders beliebten Produkten versuchen oft mehrere Kunden zeitgleich hohe Stückzahlen einzukaufen" -> Indem Bestände erst als *letzte* Vorbedingung reserviert werden, wird vermieden, dass Kunden ohne ausreichendes Limit oder Guthaben knappe Lagerbestände für andere Kunden blockieren.
   4. *Abbuchungsreihenfolge (Schritte 4–6):* `captureFunds` erfolgt vor `commitStock`, damit gesichert ist, dass das Geld eingezogen wurde, bevor die Ware endgültig das Lager verlässt.
 
-- **TODO: Point of no return wird nicht beschrieben**
+- **Point of no Return:** `captureFunds` ist der Übergang von der
+  Reservierungs- in die Bestätigungsphase. Bis dahin wird bei einem Fehler
+  zurückgerollt, ab dem gespeicherten Saga-Status `FUNDS_CAPTURED` nur noch
+  vorwärts abgeschlossen (siehe nächster Abschnitt).
+
+## Reihenfolge der Schritte und Point of no Return
+
+Die Begründung der Reihenfolge steht in den Entscheidungen oben. Die Tabelle
+zeigt, was bei einem Fehler in jedem Schritt passiert:
+
+| Nr. | Schritt | Phase | Bei Fehler |
+| --- | --- | --- | --- |
+| 1 | `reserveLimit` | Reservierung | nichts zu kompensieren |
+| 2 | `reserveFunds` | Reservierung | Limit freigeben |
+| 3 | `reserveStock` | Reservierung | Guthaben und Limit freigeben |
+| 4 | `captureFunds` | **Point of no Return** | scheitert die Abbuchung selbst eindeutig, wird alles freigegeben (Fehlerpfad 1b) |
+| 5 | `confirmLimit` | Bestätigung | **kein Rückrollen**, idempotent wiederholen |
+| 6 | `commitStock` | Bestätigung | **kein Rückrollen**, idempotent wiederholen (Fehlerpfad 2b) |
+
+**Bis einschließlich Schritt 4** wird bei einem eindeutigen Fehler
+zurückgerollt (Backward Recovery). **Ab dem gespeicherten Saga-Status
+`FUNDS_CAPTURED`** wird nicht mehr zurückgerollt, sondern nur noch vorwärts
+abgeschlossen (Forward Recovery). Das ist möglich, weil die Schritte 5 und 6
+nur noch bestehende Reservierungen in Buchungen umwandeln: Limit und Bestand
+sind für diese `saleId` bereits gesichert, deshalb können diese Schritte
+nicht mehr fachlich scheitern, sondern nur technisch (Timeout, Ausfall). Ein
+technischer Fehler wird durch idempotente Wiederholung gelöst.
+
+Die Choreographie verwendet dieselbe Reihenfolge; dort markiert das Event
+`FundsCaptured` den Point of no Return.
 
 
 ## Fehlerpfad 1a: Account Service scheitert bei der Guthabenreservierung
@@ -471,7 +501,7 @@ sequenceDiagram
   `CONFIRMED`, unabhängig davon, ob der erste oder der zweite Aufruf die
   Bestandsbuchung tatsächlich durchgeführt hat.
 
-### 2b.2 Retry des Bestandsabbuchens scheitert erneut
+### 2b.2 Produkt Service bleibt nach dem Timeout länger nicht erreichbar
 
 ```mermaid
 flowchart LR
@@ -483,12 +513,11 @@ flowchart LR
     VS -->|1. Limit reservieren| LS
     VS -->|2. Guthaben reservieren| AS
     VS -->|3. Produkt reservieren| PS
-    VS -->|4. Konto belasten| AS
+    VS -->|4. Konto belasten, Point of no Return| AS
     VS -->|5. Limit abbuchen| LS
     VS -->|6. Bestand abbuchen Timeout| PS
-    VS -->|7. Bestand erneut Fehler| PS
-    VS -->|8. Geld erstatten| AS
-    VS -->|9. Limit zurueckrollen| LS
+    VS -->|7. Status abfragen mit Backoff, bis PS antwortet| PS
+    VS -->|8. Bestand mit gleicher saleId abbuchen| PS
 ```
 
 ```mermaid
@@ -507,31 +536,45 @@ sequenceDiagram
     PS-->>VS: RESERVED
     VS->>AS: captureFunds(saleId)
     AS-->>VS: CONFIRMED
+    VS->>VS: Saga FUNDS_CAPTURED speichern (DB)
+    Note over VS,PS: Point of no Return: ab hier nur noch vorwärts
     VS->>LS: confirmLimit(saleId)
     LS-->>VS: CONFIRMED
 
     VS->>PS: commitStock(saleId)
     PS-->>VS: TIMEOUT
     VS->>VS: PRODUCT_COMMIT_RECONCILIATION_PENDING speichern (DB)
-    VS->>PS: commitStock(saleId) idempotent wiederholen
-    PS-->>VS: ERROR
+    loop Retry mit exponentiellem Backoff, bis PS antwortet
+        VS->>PS: getCommitStatus(saleId)
+        PS-->>VS: TIMEOUT
+    end
     VS->>PS: getCommitStatus(saleId)
-    PS-->>VS: NOT_RESERVED
-    VS->>AS: refundFunds(saleId)
-    AS-->>VS: REFUNDED
-    VS->>LS: rollbackLimit(saleId)
-    LS-->>VS: ROLLED_BACK
-    VS->>VS: Saga FAILED speichern (DB) und Lease freigeben
+    PS-->>VS: STOCK_RESERVED (noch nicht abgebucht)
+    VS->>PS: commitStock(saleId) idempotent wiederholen
+    Note right of PS: Reservierung in Abbuchung umwandeln,<br/>COMMITTED speichern (DB)
+    PS-->>VS: CONFIRMED
+    VS->>VS: Saga COMPLETED speichern (DB) und Lease freigeben
 ```
 
 #### Entscheidung in 2b.2
 
-- Nach einem zweiten Fehler wird anhand der idempotenten `saleId` der
-  Produktstatus abgefragt. Dieses Diagramm zeigt den Fall `NOT_RESERVED`.
-- Weil kein Produkt verbindlich gebucht wurde, wird die bereits erfolgte
-  Zahlung erstattet und das Tageslimit zurückgerollt.
-- Ergibt die Statusabfrage stattdessen `CONFIRMED`, gilt dieselbe erfolgreiche
-  Auflösung wie in 2b.1; es wird weder erstattet noch zurückgerollt.
+- `commitStock` liegt **nach dem Point of no Return**. Geld und Limit sind
+  bereits gebucht, deshalb wird nicht kompensiert, sondern so lange idempotent
+  wiederholt, bis der Produkt Service wieder antwortet.
+- Das ist sicher, weil der Bestand seit `reserveStock` für diese `saleId`
+  reserviert ist. `commitStock` kann daher nur technisch (Timeout, Ausfall),
+  aber nicht fachlich scheitern; kein anderer Kunde kann die reservierte Menge
+  in der Zwischenzeit kaufen.
+- Die Statusabfrage `getCommitStatus(saleId)` klärt das unbekannte Ergebnis des
+  ersten Aufrufs: `COMMITTED` → Saga direkt abschließen (wie 2b.1),
+  `STOCK_RESERVED` → `commitStock` erneut senden.
+- Die Reservierung wird vom Ablaufjob des Produkt Service nicht freigegeben,
+  weil der Verkaufsservice auf `getSaleStatus(saleId)` einen Status nach
+  `FUNDS_CAPTURED` meldet (siehe
+  [Absicherung gegen verwaiste Reservierungen](#absicherung-gegen-verwaiste-reservierungen)).
+- Ein fachlicher Sonderfall nach dem Abschluss (z. B. Ware beim Kommissionieren
+  beschädigt) ist **kein Teil dieser Saga**, sondern ein eigener, manueller
+  Stornoprozess mit `refundFunds` und `rollbackLimit`.
 
 # Choreographie
 
@@ -594,8 +637,12 @@ sequenceDiagram
   Orchestrierung ist das nur Komfort: Limit, Guthaben und Bestand werden durch
   die atomaren Reservierungen der Fachservices geschützt (siehe
   [Nebenläufigkeit](#nebenläufigkeit)).
-- Die Reihenfolge bleibt fachlich gleich: Limit und Guthaben werden reserviert,
-  das Produkt wird verbindlich zugeteilt und erst danach wird Geld belastet.
+- Die Reihenfolge ist dieselbe wie bei der Orchestrierung und wird dort
+  [begründet](#reihenfolge-der-schritte-und-point-of-no-return): Limit und
+  Guthaben werden reserviert, das Produkt wird verbindlich zugeteilt und erst
+  danach wird Geld belastet. Mit dem Event `FundsCaptured` ist der **Point of
+  no Return** erreicht; danach publiziert kein Service mehr ein Ereignis, das
+  Kompensationen auslöst.
 - Die `... event`-Pfeile sind asynchrone Nachrichten über das Kafka-Topic
   `sale-events`. Jedes Event enthält mindestens `messageId`, `saleId`,
   Ereignistyp, Version und Zeitstempel. Empfänger verarbeiten ein Event nur
@@ -813,7 +860,7 @@ sequenceDiagram
 - Ein bereits verarbeitetes Ereignis liefert nur erneut `SaleCompleted`; der
   Bestand wird nicht zweimal abgebucht.
 
-### 2b.2 Retry des Bestandsabbuchens scheitert erneut
+### 2b.2 Produkt Service bleibt nach dem Timeout länger nicht erreichbar
 
 ```mermaid
 flowchart LR
@@ -821,49 +868,51 @@ flowchart LR
     LS[Limit Service]
     PS[Produkt Service]
 
-    LS -->|1. LimitConfirmed event| PS
-    PS -->|2. ProductCommitFailed event| AS
-    PS -->|3. ProductCommitFailed event| LS
-    AS -->|4. FundsRefunded event| PS
-    LS -->|5. LimitRolledBack event| PS
+    AS -->|1. FundsCaptured event, Point of no Return| LS
+    LS -->|2. LimitConfirmed event| PS
+    PS -->|3. Verarbeitung Timeout, Offset nicht committen| PS
+    PS -->|4. Retry mit Backoff, bis die DB antwortet| PS
+    PS -->|5. SaleCompleted event| LS
 ```
 
 ```mermaid
 sequenceDiagram
     autonumber
+    actor Kunde
     participant AS as Account Service
     participant LS as Limit Service
     participant PS as Produkt Service
 
+    AS->>AS: Guthaben belasten und FUNDS_CAPTURED speichern (DB)
+    AS-->>LS: FundsCaptured event
+    Note over AS,PS: Point of no Return: ab hier nur noch vorwärts
+    LS->>LS: Limit abbuchen und LIMIT_CONFIRMED speichern (DB)
     LS-->>PS: LimitConfirmed event
-    PS->>PS: Zweiter commitStock Versuch schlaegt fehl
-    PS->>PS: PRODUCT_COMMIT_RECONCILIATION_PENDING speichern (DB)
-    PS->>PS: Commit Status nach Recovery mit saleId aufloesen
-    alt Bestand war bereits abgebucht
-        PS->>PS: Bestand freigeben und STOCK_RELEASED speichern (DB)
-    else Bestand war nicht abgebucht
-        PS->>PS: Reservierung loeschen und STOCK_RELEASED speichern (DB)
+    PS->>PS: commitStock Timeout, Transaktion zurückgerollt
+    Note right of PS: Kafka-Offset wird nicht committet,<br/>Event bleibt offen
+    loop Retry mit exponentiellem Backoff
+        PS->>PS: LimitConfirmed mit gleicher saleId erneut verarbeiten
     end
-    PS-->>AS: ProductCommitFailed event
-    PS-->>LS: ProductCommitFailed event
-    AS->>AS: Guthaben erstatten und FUNDS_REFUNDED speichern (DB)
-    LS->>LS: Limit zurueckrollen und LIMIT_ROLLED_BACK speichern (DB)
-    AS-->>PS: FundsRefunded event
-    LS-->>PS: LimitRolledBack event
+    PS->>PS: Status der saleId lesen, Reservierung STOCK_RESERVED vorhanden
+    PS->>PS: Bestand einmalig abbuchen und COMMITTED speichern (DB)
+    PS-->>LS: SaleCompleted event
+    PS-->>Kunde: SaleCompleted Benachrichtigung
 ```
 
 #### Entscheidung in 2b.2
 
-- Nach dem zweiten fehlgeschlagenen Verarbeitungsversuch hält Product Service
-  zunächst `PRODUCT_COMMIT_RECONCILIATION_PENDING` fest. Erst nachdem der
-  Bestand mit derselben `saleId` aufgelöst wurde, publiziert er
-  `ProductCommitFailed`. Dadurch wird nicht versehentlich erstattet, obwohl die
-  erste Bestandsbuchung bereits erfolgreich war.
-- Account und Limit kompensieren ihre endgültigen Buchungen als Reaktion auf das
-  Fehlerereignis. Product Service bereinigt seine unklare Teilwirkung
-  idempotent, sobald sein eigener Zustand wieder verfügbar ist. War der Bestand
-  trotz Timeout bereits abgebucht, gibt Product Service ihn vor dem Abschluss
-  der Kompensation wieder frei.
+- Mit `FundsCaptured` ist der **Point of no Return** überschritten. Der Produkt
+  Service publiziert deshalb **kein** Fehlerereignis, das Erstattungen auslösen
+  würde, sondern verarbeitet `LimitConfirmed` so lange erneut, bis die
+  Abbuchung gelingt.
+- Weil der Offset erst nach dem erfolgreichen DB-Commit bestätigt wird, geht das
+  Event auch bei einem Absturz des Produkt Service nicht verloren.
+- Vor der Abbuchung prüft der Produkt Service den gespeicherten Status der
+  `saleId`. War der erste Versuch trotz Timeout schon erfolgreich
+  (`COMMITTED`), wird nur `SaleCompleted` erneut publiziert und nicht doppelt
+  abgebucht.
+- Wie in der Orchestrierung ist ein fachlicher Sonderfall nach dem Abschluss
+  (beschädigte Ware) ein eigener, manueller Stornoprozess.
 
 # Recovery nach einem Absturz
 
