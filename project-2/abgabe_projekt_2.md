@@ -95,17 +95,17 @@ sequenceDiagram
     VS->>VS: CHECKOUT_IN_PROGRESS und Lease speichern (DB)
 
     VS->>LS: reserveLimit(saleId, customerId, tag, betrag)
-    Note right of LS: Kurzer Lock und Status LIMIT_RESERVED speichern (DB)
+    Note right of LS: Zeilen-Lock (SELECT ... FOR UPDATE) und LIMIT_RESERVED speichern (DB)
     LS-->>VS: RESERVED
     VS->>VS: Saga-Status LIMIT_RESERVED speichern (DB)
 
     VS->>AS: reserveFunds(saleId, customerId, betrag)
-    Note right of AS: Atomar reservieren und Status FUNDS_RESERVED speichern (DB)
+    Note right of AS: Atomares bedingtes Update und FUNDS_RESERVED speichern (DB)
     AS-->>VS: RESERVED
     VS->>VS: Saga-Status FUNDS_RESERVED speichern (DB)
 
     VS->>PS: reserveStock(saleId, productId, menge)
-    Note right of PS: Erste Anfrage gewinnt und Status STOCK_RESERVED speichern (DB)
+    Note right of PS: Atomares bedingtes Update und STOCK_RESERVED speichern (DB)
     PS-->>VS: RESERVED
     VS->>VS: Saga-Status STOCK_RESERVED speichern (DB)
 
@@ -125,17 +125,21 @@ sequenceDiagram
 
 ### Entscheidungen im Happy Path
 
-- **Ein Checkout pro Account:** Der Verkaufsservice hält eine gespeicherte
-  Checkout-Lease mit `saleId`. Ein zweiter Tab kann deshalb keinen parallelen
-  Kauf starten; die Lease wird nach Abschluss, Fehler oder Ablauf freigegeben.
+- **Ein Checkout pro Account (Komfort, keine Sicherheitsmaßnahme):** Der
+  Verkaufsservice hält eine gespeicherte Checkout-Lease mit `saleId`, damit ein
+  zweiter Tab oder ein Doppelklick keinen zweiten Kauf startet. Die Einhaltung
+  des Limits hängt **nicht** von dieser Lease ab (siehe
+  [Nebenläufigkeit](#nebenläufigkeit)).
 
 - **Verbindliche Reservierungen und Nebenläufigkeit:** Eine Warenkorbprüfung ist
-  unverbindlich. Gegen Race Conditions bei parallelen Anfragen greifen gezielte Mechanismen:
+  unverbindlich. Gegen Race Conditions bei parallelen Anfragen greifen gezielte Mechanismen
+  (Details und Beispiel im Kapitel [Nebenläufigkeit](#nebenläufigkeit)):
   - *Limit Service (Pessimistisches Locking):* Verwendet ein kurzes Zeilen-Lock
     (`SELECT ... FOR UPDATE`), um parallele Abfragen desselben Kunden strikt zu serialisieren.
   - *Account & Produkt Service (Atomare Reservierung):* Statt getrenntem Lesen und Prüfen
     im Code erfolgt die Reservierung direkt als bedingtes atomares SQL-Update
-    (`WHERE balance/stock >= betrag/menge`). Prüfung und Buchung bilden so einen unteilbaren
+    (`WHERE balance - reserved >= betrag` bzw. `WHERE available - reserved >= menge`).
+    Prüfung und Buchung bilden so einen unteilbaren
     Schritt – die erste Anfrage gewinnt, Überziehungen oder Überverkäufe sind ausgeschlossen.
 
 - **Produkt vor Abbuchung:** `reserveStock` sichert das Produkt für den Kunden.
@@ -586,7 +590,10 @@ sequenceDiagram
 - `saleId` ist bei jedem Ereignis enthalten. Dadurch sind doppelte Zustellungen
   idempotent und führen nicht zu einer zweiten Reservierung oder Buchung.
 - Account Service speichert beim Empfang von `LimitReserved` die Checkout Lease
-  pro Account. Damit können mehrere Tabs keinen parallelen Kauf auslösen.
+  pro Account, damit mehrere Tabs keinen parallelen Kauf auslösen. Wie bei der
+  Orchestrierung ist das nur Komfort: Limit, Guthaben und Bestand werden durch
+  die atomaren Reservierungen der Fachservices geschützt (siehe
+  [Nebenläufigkeit](#nebenläufigkeit)).
 - Die Reihenfolge bleibt fachlich gleich: Limit und Guthaben werden reserviert,
   das Produkt wird verbindlich zugeteilt und erst danach wird Geld belastet.
 - Die `... event`-Pfeile sind asynchrone Nachrichten über das Kafka-Topic
@@ -953,3 +960,106 @@ Zur Rekonstruktion eines einzelnen Verkaufs genügt es, alle Events mit dessen
 Services nach dieser `saleId` abzufragen. Weil jeder Service sein eingehendes
 Event erst nach dem eigenen DB-Commit bestätigt, geht weder ein Schritt noch
 eine Kompensation verloren.
+
+# Nebenläufigkeit
+
+Die Aufgabenstellung nennt zwei Angriffs- bzw. Lastmuster: Kunden versuchen,
+das Limit durch **parallele Anfragen** zu umgehen, und bei beliebten Produkten
+kaufen **mehrere Kunden gleichzeitig** hohe Stückzahlen. Beide werden in der
+Datenbank des zuständigen Services gelöst, also dort, wo die Daten liegen:
+
+- **Limit Service: pessimistisches Locking.** Die Zeile des Kunden für den
+  aktuellen Tag wird mit `SELECT ... FOR UPDATE` gesperrt; Prüfung und
+  Reservierung erfolgen in derselben Transaktion. Der sicherheitsrelevante
+  Service serialisiert damit alle Anfragen eines Kunden explizit.
+- **Account und Produkt Service: atomare Reservierung.** Prüfung und Buchung
+  sind ein einziges bedingtes `UPDATE`.
+
+In beiden Fällen gibt es zwischen Prüfung und Buchung kein Zeitfenster, in dem
+eine zweite Anfrage dieselbe Prüfung bestehen könnte.
+
+## Mechanismus je Service
+
+| Service | Atomare Reservierung (eine lokale Transaktion) | Invariante |
+| --- | --- | --- |
+| Limit Service (pessimistisches Locking) | `SELECT used, reserved FROM daily_limit WHERE customer_id = :kunde AND day = :tag FOR UPDATE`; im Code prüfen `used + reserved + :betrag <= 200`; dann `UPDATE daily_limit SET reserved = reserved + :betrag …` und `INSERT INTO limit_reservation (sale_id, …)`; Commit gibt das Lock frei | `used + reserved ≤ 200 €` je Kunde und Tag |
+| Account Service (atomare Reservierung) | `UPDATE account SET reserved = reserved + :betrag WHERE customer_id = :kunde AND balance - reserved >= :betrag` und `INSERT INTO funds_reservation (sale_id, …)` | `reserved ≤ balance`, kein Überziehen |
+| Produkt Service (atomare Reservierung) | `UPDATE stock SET reserved = reserved + :menge WHERE product_id = :produkt AND available - reserved >= :menge` und `INSERT INTO stock_reservation (sale_id, …)` | `reserved ≤ available` je Produkt |
+
+- **Prüfung nicht bestanden** (Limit: Summe > 200 €; Account/Produkt:
+  „0 Zeilen geändert“) bedeutet, dass die Bedingung nicht erfüllt ist: Die Transaktion wird zurückgerollt und der Service antwortet
+  `REJECTED` (z. B. `LIMIT_EXCEEDED`, `INSUFFICIENT_FUNDS`, `OUT_OF_STOCK`).
+- **Serialisierung:** `SELECT ... FOR UPDATE` bzw. das `UPDATE` sperrt die betroffene Zeile
+  (Kunde + Tag, Konto bzw. Produkt) bis zum Commit. Eine parallele Anfrage
+  wartet kurz und wertet die Bedingung danach mit dem bereits erhöhten
+  `reserved` aus. Die Sperre gilt nur für die Dauer **einer lokalen
+  Transaktion** (Millisekunden), nie über einen Netzwerkaufruf oder die
+  gesamte Saga.
+- **Idempotenz:** `sale_id` ist Primärschlüssel der Reservierungstabellen. Eine
+  wiederholte Anfrage mit derselben `saleId` findet die vorhandene Reservierung
+  und liefert deren Status, statt ein zweites Mal zu reservieren.
+- **Endgültige Buchung** verschiebt den Betrag bzw. die Menge atomar von
+  `reserved` nach `used` (Limit), zieht ihn von `balance` ab (Account) bzw. von
+  `available` ab (Produkt). Freigaben verringern nur `reserved`. Die
+  Invarianten gelten damit in jedem Zwischenzustand.
+- **Tagesgrenze:** Der Tag (`day`) wird vom Limit Service selbst in einer festen
+  Zeitzone (Europe/Vienna) bestimmt, nicht vom Client übernommen. Existiert für
+  den Tag noch keine Zeile, wird sie per `INSERT ... ON CONFLICT DO NOTHING`
+  angelegt, bevor sie gesperrt wird.
+
+## Beispiel: zwei parallele Käufe desselben Kunden
+
+Der Kunde hat heute noch nichts gekauft (`used = 0`, `reserved = 0`) und startet
+in zwei Tabs gleichzeitig Kauf A über 150 € und Kauf B über 100 €. Gemeinsam
+würden beide das Limit von 200 € überschreiten.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant VA as Verkaufsservice (Kauf A)
+    participant VB as Verkaufsservice (Kauf B)
+    participant LS as Limit Service
+    participant DB as Limit DB
+
+    par gleichzeitig
+        VA->>LS: reserveLimit(saleA, kunde, tag, 150)
+    and
+        VB->>LS: reserveLimit(saleB, kunde, tag, 100)
+    end
+    LS->>DB: saleA: SELECT ... FOR UPDATE (kunde, tag)
+    Note right of DB: Zeile (kunde, tag) für saleA gesperrt
+    LS->>DB: saleB: SELECT ... FOR UPDATE (kunde, tag)
+    Note right of DB: saleB wartet auf das Lock
+    LS->>LS: saleA: 0 + 0 + 150 <= 200, ok
+    LS->>DB: saleA: reserved = 150, limit_reservation speichern (DB), Commit
+    LS-->>VA: RESERVED
+    Note right of DB: Lock frei, saleB liest reserved = 150
+    LS->>LS: saleB: 0 + 150 + 100 > 200, abgelehnt
+    LS->>DB: saleB: Rollback
+    LS-->>VB: REJECTED (LIMIT_EXCEEDED)
+    VB->>VB: Saga FAILED speichern (DB)
+```
+
+Derselbe Ablauf gilt für den Lagerstand: Kaufen zwei Kunden gleichzeitig ein
+beliebtes Produkt, erhält nur die Anfrage eine Reservierung, für die
+`available - reserved` noch ausreicht; die andere wird mit `OUT_OF_STOCK`
+abgelehnt, und ihre Saga kompensiert Limit und Guthaben wie in den Fehlerpfaden.
+
+## Warum keine Lease oder kein verteiltes Lock als Schutz?
+
+- Der Limit Service ist **sicherheitsrelevant** und darf sich nicht darauf
+  verlassen, dass ein Aufrufer (Verkaufsservice, Account Service) parallele
+  Käufe verhindert. Die Invariante wird deshalb dort durchgesetzt, wo die Daten
+  liegen.
+- In der Choreographie gibt es keinen zentralen Verkaufsservice, der eine Lease
+  halten könnte. Das bedingte Update funktioniert in beiden Varianten
+  unverändert.
+- Ein verteiltes Lock über die gesamte Saga würde ein beliebtes Produkt für die
+  Dauer eines kompletten Kaufs blockieren. Die zeilenbezogene Sperre einer
+  einzelnen lokalen Transaktion hält dagegen nur Millisekunden.
+- Warum beim Limit pessimistisch und bei Account/Produkt bedingt? Beim Limit
+  ist ein Missbrauch mit parallelen Anfragen dokumentiert; das explizite Lock
+  macht die Serialisierung pro Kunde und Tag sichtbar und überprüfbar. Bei
+  Account und Produkt genügt das bedingte `UPDATE`, das intern dieselbe
+  Zeilensperre nutzt, aber ohne zusätzlichen Lese-Roundtrip auskommt. Das ist
+  vor allem beim stark umkämpften Bestand beliebter Produkte wichtig.
