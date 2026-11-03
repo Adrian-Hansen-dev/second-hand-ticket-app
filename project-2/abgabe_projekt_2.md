@@ -743,7 +743,25 @@ sequenceDiagram
 
 ## Fehlerpfad 2a: Timeout bei der Produktreservierung
 
-### 2a.1 Retry der Produktreservierung ist erfolgreich
+In der Choreographie ruft niemand den Produkt Service synchron auf. Ein Timeout
+wird deshalb an zwei Stellen behandelt:
+
+1. **Im Produkt Service:** Der Zugriff auf seine Datenbank beim Verarbeiten von
+   `FundsReserved` läuft in ein Timeout. Die lokale Transaktion wird
+   zurückgerollt, der Kafka-Offset nicht committet, und das Event wird mit
+   Backoff erneut verarbeitet. Ob ein früherer Versuch trotz Timeout schon
+   committet hat, klärt der Produkt Service selbst über eine **lokale
+   Statusabfrage** der `saleId` in `stock_reservation`.
+2. **Beim wartenden Service:** Der Account Service hat `FundsReserved`
+   publiziert und wartet auf `StockReserved`. Er speichert dabei eine **Frist**
+   (`stock_deadline`, z. B. 30 s) in `funds_reservation` (DB); dieselbe Frist
+   steht auch im Event. Ein Deadline-Job prüft abgelaufene Fristen. Das ist das
+   Gegenstück zum Aufruf-Timeout des Verkaufsservice in der Orchestrierung.
+
+Die Frist gilt nur **vor** dem Point of no Return. Hat der Account Service
+`FundsCaptured` gespeichert, wird nicht mehr abgebrochen (siehe Fehlerpfad 2b).
+
+### 2a.1 Retry innerhalb der Frist ist erfolgreich
 
 ```mermaid
 flowchart LR
@@ -752,10 +770,10 @@ flowchart LR
     PS[Produkt Service]
 
     LS -->|1. LimitReserved event| AS
-    AS -->|2. FundsReserved event| PS
-    PS -->|3. Verarbeitung Timeout| PS
-    PS -->|4. Gleiche Nachricht erneut verarbeiten| PS
-    PS -->|5. StockReserved event| AS
+    AS -->|2. FundsReserved event, Frist speichern| PS
+    PS -->|3. DB-Zugriff Timeout, Retry mit Backoff| PS
+    PS -->|4. StockReserved event vor Fristablauf| AS
+    AS -->|5. FundsCaptured event| LS
 ```
 
 ```mermaid
@@ -766,23 +784,30 @@ sequenceDiagram
     participant PS as Produkt Service
 
     LS-->>AS: LimitReserved event
-    AS->>AS: Guthaben reservieren
-    AS-->>PS: FundsReserved event
-    PS->>PS: reserveStock Verarbeitung Timeout
-    PS->>PS: FundsReserved mit gleicher saleId erneut verarbeiten
+    AS->>AS: Guthaben reservieren, FUNDS_RESERVED und stock_deadline speichern (DB)
+    AS-->>PS: FundsReserved event (saleId, deadline)
+    PS->>PS: reserveStock: DB-Zugriff Timeout, Transaktion zurückgerollt
+    Note right of PS: Offset nicht committet,<br/>Ergebnis für saleId unbekannt
+    PS->>PS: FundsReserved mit gleicher saleId erneut verarbeiten (Backoff)
+    PS->>PS: Statusabfrage saleId in stock_reservation: keine Reservierung
     PS->>PS: Bestand einmalig reservieren und STOCK_RESERVED speichern (DB)
     PS-->>AS: StockReserved event
+    AS->>AS: Frist nicht abgelaufen, Guthaben belasten und FUNDS_CAPTURED speichern (DB)
     AS-->>LS: FundsCaptured event
-    LS-->>PS: LimitConfirmed event
+    Note over LS,PS: weiter wie im Happy Path
 ```
 
 #### Entscheidung in 2a.1
 
-- Die erneute Zustellung desselben `FundsReserved`-Ereignisses ist erlaubt,
-  weil Product Service anhand der `saleId` genau einmal reserviert.
-- Sobald `StockReserved` publiziert wird, läuft die Choreographie normal weiter.
+- Die erneute Verarbeitung desselben `FundsReserved`-Events ist sicher, weil
+  der Produkt Service vor dem Reservieren den Status der `saleId` liest.
+  Existiert schon eine Reservierung (der erste Versuch hatte trotz Timeout
+  committet), wird nur `StockReserved` erneut publiziert.
+- Der Account Service bucht nur ab, wenn `StockReserved` **vor** Ablauf der
+  Frist eintrifft. Prüfung von Frist und Status und die Abbuchung erfolgen in
+  einer lokalen Transaktion auf der Zeile in `funds_reservation`.
 
-### 2a.2 Retry der Produktreservierung scheitert erneut
+### 2a.2 Frist läuft ab, bevor der Produkt Service antwortet
 
 ```mermaid
 flowchart LR
@@ -790,38 +815,62 @@ flowchart LR
     AS[Account Service]
     PS[Produkt Service]
 
-    AS -->|1. FundsReserved event| PS
-    PS -->|2. ProductReservationFailed event| AS
-    PS -->|3. ProductReservationFailed event| LS
-    AS -->|4. FundsReleased event| PS
-    LS -->|5. LimitReleased event| PS
+    LS -->|1. LimitReserved event| AS
+    AS -->|2. FundsReserved event, Frist speichern| PS
+    PS -->|3. DB-Zugriff Timeout, wiederholt| PS
+    AS -->|4. SaleTimedOut event nach Fristablauf| LS
+    AS -->|5. SaleTimedOut event| PS
 ```
 
 ```mermaid
 sequenceDiagram
     autonumber
+    actor Kunde
     participant LS as Limit Service
     participant AS as Account Service
     participant PS as Produkt Service
 
-    AS-->>PS: FundsReserved event
-    PS->>PS: Zweiter Verarbeitungsversuch schlaegt fehl
-    PS-->>AS: ProductReservationFailed event
-    PS-->>LS: ProductReservationFailed event
-    AS->>AS: Guthaben freigeben und FUNDS_RELEASED speichern (DB)
+    LS-->>AS: LimitReserved event
+    AS->>AS: Guthaben reservieren, FUNDS_RESERVED und stock_deadline speichern (DB)
+    AS-->>PS: FundsReserved event (saleId, deadline)
+    loop Retry mit Backoff
+        PS->>PS: reserveStock: DB-Zugriff Timeout, Transaktion zurückgerollt
+    end
+    Note over AS: Deadline-Job: stock_deadline abgelaufen
+    AS->>AS: Guthaben freigeben, FUNDS_RELEASED und SaleTimedOut in Outbox speichern (DB)
+    AS-->>LS: SaleTimedOut event
+    AS-->>PS: SaleTimedOut event
     LS->>LS: Limit freigeben und LIMIT_RELEASED speichern (DB)
-    AS-->>PS: FundsReleased event
-    LS-->>PS: LimitReleased event
-    PS->>PS: Eigene unklare Reservierung nach Recovery freigeben
+    LS-->>Kunde: SaleFailed Benachrichtigung
+    Note right of PS: Produkt Service wieder verfügbar
+    PS->>PS: FundsReserved: deadline im Event abgelaufen, nicht reservieren
+    PS->>PS: SaleTimedOut verarbeiten, Statusabfrage saleId
+    alt Reservierung aus einem früheren Versuch vorhanden
+        PS->>PS: Bestand freigeben und STOCK_RELEASED speichern (DB)
+    else keine Reservierung vorhanden
+        PS->>PS: saleId als CANCELLED speichern (DB)
+    end
 ```
 
 #### Entscheidung in 2a.2
 
-- Product Service löst das Fehlerereignis aus. Account und Limit reagieren
-  unabhängig und geben ihre sicher bekannten Reservierungen frei.
-- Product Service verarbeitet die eingehenden Freigabeereignisse idempotent und
-  bereinigt so eine möglicherweise durch den ersten Versuch entstandene
-  Bestandsreservierung.
+- Nicht der Produkt Service, sondern der **wartende Account Service** erkennt
+  den Timeout. Er gibt sein Guthaben frei und publiziert `SaleTimedOut` in
+  derselben lokalen Transaktion. Limit und Produkt Service kompensieren
+  selbstständig.
+- Das Ergebnis beim Produkt Service ist unbekannt. Er klärt es nach seiner
+  Wiederherstellung über die `saleId`: Eine Reservierung aus einem früheren
+  Versuch wird freigegeben, sonst wird die `saleId` als `CANCELLED` gespeichert.
+  Eine spätere Zustellung von `FundsReserved` kann dann keine Reservierung mehr
+  anlegen.
+- Weil alle Events eines Verkaufs denselben Partitionsschlüssel `saleId`
+  haben, verarbeitet der Produkt Service `FundsReserved` und `SaleTimedOut`
+  in der richtigen Reihenfolge.
+- **Wettlauf zwischen Frist und Antwort:** Trifft `StockReserved` kurz nach
+  dem Fristablauf ein, findet der Account Service `FUNDS_RELEASED` und
+  ignoriert das Event; der Bestand wird über `SaleTimedOut` freigegeben. Frist
+  und Abbuchung werden auf derselben Zeile in `funds_reservation` entschieden.
+  Es gewinnt also genau eines von beiden.
 
 ## Fehlerpfad 2b: Timeout beim endgültigen Abbuchen des Bestands
 
@@ -1004,6 +1053,7 @@ Tabellen der drei Services verteilt und vollständig im Kafka-Topic
 | nach dem DB-Commit, vor dem Offset-Commit | Status, Outbox-Eintrag und `messageId` in `processed_message` | Event wird erneut zugestellt, über `processed_message` als Duplikat erkannt und nur bestätigt |
 | nach dem DB-Commit, bevor das Relay die Outbox publiziert hat | Outbox-Eintrag mit Status `PENDING` | Relay publiziert alle offenen Outbox-Einträge erneut (at-least-once) |
 | Ausfall eines ganzen Services über längere Zeit | Events bleiben im Topic (Retention z. B. 7 Tage) | Service liest ab seinem letzten Offset weiter und setzt die Saga fort |
+| Absturz des Account Service, während er auf `StockReserved` wartet | `FUNDS_RESERVED` mit `stock_deadline` in `funds_reservation` | Deadline-Job findet nach dem Neustart abgelaufene Fristen und publiziert `SaleTimedOut` (Fehlerpfad 2a.2) |
 
 Zur Rekonstruktion eines einzelnen Verkaufs genügt es, alle Events mit dessen
 `saleId` aus `sale-events` zu lesen oder die Reservierungstabellen der drei
