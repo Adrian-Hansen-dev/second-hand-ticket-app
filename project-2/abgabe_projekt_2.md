@@ -7,13 +7,35 @@ Reservierung und jede Kompensation wird mit derselben `saleId` ausgeführt.
 
 ## Gemeinsame Persistenz- und Ereignisregel
 
-Jeder mit **„speichern“** bezeichnete Schritt schreibt den jeweiligen Status
-atomar in die lokale Datenhaltung des betroffenen Services. Dargestellte
-Ereignisse werden zusammen mit dieser Statusänderung dauerhaft als ausgehende
-Nachricht gespeichert und können mit derselben `saleId` erneut zugestellt
-werden. So sind Zustellung, Retry und Recovery nachvollziehbar, ohne eine
-Datenbank oder ein konkretes Messaging-System als zusätzlichen Teilnehmer in
-den Diagrammen zu zeigen.
+Jeder Service besitzt eine **eigene relationale Datenbank** (z. B. PostgreSQL).
+In den Sequenzdiagrammen ist jeder Schritt, der Status dauerhaft schreibt, mit
+**„speichern (DB)“** markiert. Ein Fachservice antwortet erst, **nachdem** seine
+lokale Transaktion committet ist („persist, then respond“). Eine Antwort wie
+`RESERVED`, `CONFIRMED`, `RELEASED` oder `REJECTED` bedeutet damit immer, dass
+dieser Status bereits in der Datenbank des Services liegt.
+
+| Service | Tabellen | Persistierter Status |
+| --- | --- | --- |
+| Verkaufsservice | `sale_saga` | `saleId`, Kunde, Produkt, Menge, Betrag, aktueller Saga-Status, Startzeit, Checkout-Lease |
+| Limit Service | `daily_limit`, `limit_reservation` | je Kunde und Tag `used` und `reserved`; je `saleId` Betrag, Status und `expires_at` |
+| Account Service | `account`, `funds_reservation` | Kontostand `balance` und `reserved`; je `saleId` Betrag, Status und `expires_at` |
+| Produkt Service | `stock`, `stock_reservation` | je Produkt `available` und `reserved`; je `saleId` Menge, Status und `expires_at` |
+
+**Orchestrierung:** Der Verkaufsservice speichert nach jeder Antwort den neuen
+Saga-Status in `sale_saga`. Der gespeicherte Status bestimmt eindeutig den
+nächsten Schritt; nach einem Absturz wird dieser Schritt mit derselben `saleId`
+erneut ausgeführt oder kompensiert (siehe [Recovery](#recovery-nach-einem-absturz)).
+
+**Choreographie:** Events werden über das Kafka-Topic `sale-events`
+ausgetauscht (Partitionsschlüssel `saleId`, damit alle Events eines Verkaufs
+geordnet bleiben). Jeder Service nutzt das **Transactional-Outbox-Muster**:
+Statusänderung und ausgehendes Event werden in **derselben lokalen
+Transaktion** in die Fachtabelle und in die Tabelle `outbox` geschrieben; ein
+Relay publiziert die Outbox-Einträge in das Topic. Ein `... event`-Pfeil in den
+Diagrammen steht also immer für „Outbox (DB) → Kafka-Topic `sale-events`“.
+Empfänger speichern ihre Statusänderung zusammen mit der verarbeiteten
+`messageId` (Tabelle `processed_message`) und committen den Kafka-Offset erst
+danach.
 
 ## Architektureinordnung
 
@@ -70,32 +92,32 @@ sequenceDiagram
     participant PS as Produkt Service
 
     Kunde->>VS: POST /verkaeufe (saleId, customerId, productId, menge, betrag)
-    VS->>VS: CHECKOUT_IN_PROGRESS und Lease speichern
+    VS->>VS: CHECKOUT_IN_PROGRESS und Lease speichern (DB)
 
     VS->>LS: reserveLimit(saleId, customerId, tag, betrag)
-    Note right of LS: Kurzer Lock und Status LIMIT_RESERVED speichern
+    Note right of LS: Kurzer Lock und Status LIMIT_RESERVED speichern (DB)
     LS-->>VS: RESERVED
-    VS->>VS: Saga-Status LIMIT_RESERVED speichern
+    VS->>VS: Saga-Status LIMIT_RESERVED speichern (DB)
 
     VS->>AS: reserveFunds(saleId, customerId, betrag)
-    Note right of AS: Atomar reservieren und Status FUNDS_RESERVED speichern
+    Note right of AS: Atomar reservieren und Status FUNDS_RESERVED speichern (DB)
     AS-->>VS: RESERVED
-    VS->>VS: Saga-Status FUNDS_RESERVED speichern
+    VS->>VS: Saga-Status FUNDS_RESERVED speichern (DB)
 
     VS->>PS: reserveStock(saleId, productId, menge)
-    Note right of PS: Erste Anfrage gewinnt und Status STOCK_RESERVED speichern
+    Note right of PS: Erste Anfrage gewinnt und Status STOCK_RESERVED speichern (DB)
     PS-->>VS: RESERVED
-    VS->>VS: Saga-Status STOCK_RESERVED speichern
+    VS->>VS: Saga-Status STOCK_RESERVED speichern (DB)
 
     VS->>AS: captureFunds(saleId)
     AS-->>VS: CONFIRMED
-    VS->>VS: Saga-Status FUNDS_CAPTURED speichern
+    VS->>VS: Saga-Status FUNDS_CAPTURED speichern (DB)
     VS->>LS: confirmLimit(saleId)
     LS-->>VS: CONFIRMED
-    VS->>VS: Saga-Status LIMIT_CONFIRMED speichern
+    VS->>VS: Saga-Status LIMIT_CONFIRMED speichern (DB)
     VS->>PS: commitStock(saleId)
     PS-->>VS: CONFIRMED
-    VS->>VS: Saga-Status COMPLETED speichern und Lease freigeben
+    VS->>VS: Saga-Status COMPLETED speichern (DB) und Lease freigeben
     VS-->>Kunde: Verkauf bestaetigt
 
     Note over VS,PS: Recovery nutzt die gespeicherten Saga und Service Status
@@ -165,22 +187,22 @@ sequenceDiagram
 
     VS->>LS: reserveLimit(saleId)
     LS-->>VS: RESERVED
-    VS->>VS: Saga LIMIT_RESERVED speichern
+    VS->>VS: Saga LIMIT_RESERVED speichern (DB)
 
     VS->>AS: reserveFunds(saleId)
     AS-->>VS: ERROR nach 10 ms ohne Retry
-    VS->>VS: Saga COMPENSATING speichern
+    VS->>VS: Saga COMPENSATING speichern (DB)
     VS->>LS: releaseLimit(saleId)
     LS-->>VS: RELEASED
-    VS->>VS: Limit kompensiert speichern
-    VS->>VS: ACCOUNT_RECONCILIATION_PENDING speichern
+    VS->>VS: Limit kompensiert speichern (DB)
+    VS->>VS: ACCOUNT_RECONCILIATION_PENDING speichern (DB)
     Note right of AS: Service ist nicht erreichbar
     VS->>AS: healthCheck bis Service wieder verfuegbar ist
     AS-->>VS: AVAILABLE
     VS->>AS: synchronizeCompensation(saleId)
     AS-->>VS: RELEASED oder NOT_RESERVED
-    Note right of AS: Status FUNDS_RELEASED oder NOT_RESERVED speichern
-    VS->>VS: Saga FAILED speichern und Lease freigeben
+    Note right of AS: Status FUNDS_RELEASED oder NOT_RESERVED speichern (DB)
+    VS->>VS: Saga FAILED speichern (DB) und Lease freigeben
 ```
 
 ### Entscheidungen in Fehlerpfad 1a
@@ -228,29 +250,29 @@ sequenceDiagram
 
     VS->>LS: reserveLimit(saleId)
     LS-->>VS: RESERVED
-    VS->>VS: Saga LIMIT_RESERVED speichern
+    VS->>VS: Saga LIMIT_RESERVED speichern (DB)
     VS->>AS: reserveFunds(saleId)
     AS-->>VS: RESERVED
-    VS->>VS: Saga FUNDS_RESERVED speichern
+    VS->>VS: Saga FUNDS_RESERVED speichern (DB)
     VS->>PS: reserveStock(saleId)
     PS-->>VS: RESERVED
-    VS->>VS: Saga STOCK_RESERVED speichern
+    VS->>VS: Saga STOCK_RESERVED speichern (DB)
 
     VS->>AS: captureFunds(saleId)
     AS-->>VS: ERROR nach 10 ms ohne Retry
-    VS->>VS: Saga COMPENSATING speichern
+    VS->>VS: Saga COMPENSATING speichern (DB)
     VS->>PS: releaseStock(saleId)
     PS-->>VS: RELEASED
     VS->>LS: releaseLimit(saleId)
     LS-->>VS: RELEASED
-    VS->>VS: ACCOUNT_RECONCILIATION_PENDING speichern
+    VS->>VS: ACCOUNT_RECONCILIATION_PENDING speichern (DB)
     Note right of AS: Service ist nicht erreichbar
     VS->>AS: healthCheck bis Service wieder verfuegbar ist
     AS-->>VS: AVAILABLE
     VS->>AS: synchronizeCompensation(saleId)
     AS-->>VS: RELEASED oder REFUNDED
-    Note right of AS: Status FUNDS_RELEASED oder FUNDS_REFUNDED speichern
-    VS->>VS: Saga FAILED speichern und Lease freigeben
+    Note right of AS: Status FUNDS_RELEASED oder FUNDS_REFUNDED speichern (DB)
+    VS->>VS: Saga FAILED speichern (DB) und Lease freigeben
 ```
 
 ### Entscheidungen in Fehlerpfad 1b
@@ -296,25 +318,25 @@ sequenceDiagram
 
     VS->>LS: reserveLimit(saleId)
     LS-->>VS: RESERVED
-    VS->>VS: Saga LIMIT_RESERVED speichern
+    VS->>VS: Saga LIMIT_RESERVED speichern (DB)
     VS->>AS: reserveFunds(saleId)
     AS-->>VS: RESERVED
-    VS->>VS: Saga FUNDS_RESERVED speichern
+    VS->>VS: Saga FUNDS_RESERVED speichern (DB)
 
     VS->>PS: reserveStock(saleId)
     PS-->>VS: TIMEOUT
-    VS->>VS: PRODUCT_RESERVATION_PENDING speichern
+    VS->>VS: PRODUCT_RESERVATION_PENDING speichern (DB)
     Note right of PS: Produkt Ergebnis ist unbekannt
     VS->>PS: reserveStock(saleId) idempotent wiederholen
     PS-->>VS: RESERVED
-    VS->>VS: Saga STOCK_RESERVED speichern
+    VS->>VS: Saga STOCK_RESERVED speichern (DB)
     VS->>AS: captureFunds(saleId)
     AS-->>VS: CONFIRMED
     VS->>LS: confirmLimit(saleId)
     LS-->>VS: CONFIRMED
     VS->>PS: commitStock(saleId)
     PS-->>VS: CONFIRMED
-    VS->>VS: Saga COMPLETED speichern und Lease freigeben
+    VS->>VS: Saga COMPLETED speichern (DB) und Lease freigeben
 ```
 
 #### Entscheidung in 2a.1
@@ -360,18 +382,18 @@ sequenceDiagram
     AS-->>VS: RESERVED
     VS->>PS: reserveStock(saleId)
     PS-->>VS: TIMEOUT
-    VS->>VS: PRODUCT_RESERVATION_PENDING speichern
+    VS->>VS: PRODUCT_RESERVATION_PENDING speichern (DB)
     VS->>PS: reserveStock(saleId) idempotent wiederholen
     PS-->>VS: ERROR
-    VS->>VS: Saga COMPENSATING speichern
+    VS->>VS: Saga COMPENSATING speichern (DB)
     VS->>AS: releaseFunds(saleId)
     AS-->>VS: RELEASED
     VS->>LS: releaseLimit(saleId)
     LS-->>VS: RELEASED
-    VS->>VS: PRODUCT_RECONCILIATION_PENDING speichern
+    VS->>VS: PRODUCT_RECONCILIATION_PENDING speichern (DB)
     VS->>PS: releaseStock(saleId) idempotent wiederholen
     PS-->>VS: RELEASED oder NOT_RESERVED
-    VS->>VS: Saga FAILED speichern und Lease freigeben
+    VS->>VS: Saga FAILED speichern (DB) und Lease freigeben
 ```
 
 #### Entscheidung in 2a.2
@@ -430,11 +452,11 @@ sequenceDiagram
 
     VS->>PS: commitStock(saleId)
     PS-->>VS: TIMEOUT
-    VS->>VS: PRODUCT_COMMIT_RECONCILIATION_PENDING speichern
+    VS->>VS: PRODUCT_COMMIT_RECONCILIATION_PENDING speichern (DB)
     Note right of PS: Produkt Ergebnis ist unbekannt
     VS->>PS: commitStock(saleId) idempotent wiederholen
     PS-->>VS: CONFIRMED
-    VS->>VS: Saga COMPLETED speichern und Lease freigeben
+    VS->>VS: Saga COMPLETED speichern (DB) und Lease freigeben
 ```
 
 #### Entscheidung in 2b.1
@@ -486,7 +508,7 @@ sequenceDiagram
 
     VS->>PS: commitStock(saleId)
     PS-->>VS: TIMEOUT
-    VS->>VS: PRODUCT_COMMIT_RECONCILIATION_PENDING speichern
+    VS->>VS: PRODUCT_COMMIT_RECONCILIATION_PENDING speichern (DB)
     VS->>PS: commitStock(saleId) idempotent wiederholen
     PS-->>VS: ERROR
     VS->>PS: getCommitStatus(saleId)
@@ -495,7 +517,7 @@ sequenceDiagram
     AS-->>VS: REFUNDED
     VS->>LS: rollbackLimit(saleId)
     LS-->>VS: ROLLED_BACK
-    VS->>VS: Saga FAILED speichern und Lease freigeben
+    VS->>VS: Saga FAILED speichern (DB) und Lease freigeben
 ```
 
 #### Entscheidung in 2b.2
@@ -512,8 +534,9 @@ sequenceDiagram
 Bei der Choreographie startet der Kunde den Kauf beim Limit Service. Die
 Fachservices entscheiden anhand von Ereignissen selbst, welchen Schritt oder
 welche Kompensation sie ausführen. Die Pfeile mit
-`... event` stehen für dauerhaft publizierte Ereignisse; ein konkretes
-Messaging-System wird hier bewusst nicht festgelegt.
+`... event` stehen für dauerhaft publizierte Ereignisse im Kafka-Topic
+`sale-events`, die über die Outbox des sendenden Services geschrieben werden
+(siehe [Persistenzregel](#gemeinsame-persistenz--und-ereignisregel)).
 
 ## Happy Path: Komponentendiagramm
 
@@ -541,17 +564,17 @@ sequenceDiagram
     participant PS as Produkt Service
 
     Kunde->>LS: startSale Command (saleId, customerId, productId, menge, betrag)
-    LS->>LS: Limit reservieren und LIMIT_RESERVED speichern
+    LS->>LS: Limit reservieren und LIMIT_RESERVED speichern (DB)
     LS-->>AS: LimitReserved event
-    AS->>AS: Checkout Lease und FUNDS_RESERVED speichern
+    AS->>AS: Checkout Lease und FUNDS_RESERVED speichern (DB)
     AS-->>PS: FundsReserved event
-    PS->>PS: Bestand reservieren und STOCK_RESERVED speichern
+    PS->>PS: Bestand reservieren und STOCK_RESERVED speichern (DB)
     PS-->>AS: StockReserved event
-    AS->>AS: Guthaben belasten und FUNDS_CAPTURED speichern
+    AS->>AS: Guthaben belasten und FUNDS_CAPTURED speichern (DB)
     AS-->>LS: FundsCaptured event
-    LS->>LS: Limit abbuchen und LIMIT_CONFIRMED speichern
+    LS->>LS: Limit abbuchen und LIMIT_CONFIRMED speichern (DB)
     LS-->>PS: LimitConfirmed event
-    PS->>PS: Bestand abbuchen und COMPLETED speichern
+    PS->>PS: Bestand abbuchen und COMPLETED speichern (DB)
     PS-->>Kunde: SaleCompleted Benachrichtigung
 ```
 
@@ -566,8 +589,8 @@ sequenceDiagram
   pro Account. Damit können mehrere Tabs keinen parallelen Kauf auslösen.
 - Die Reihenfolge bleibt fachlich gleich: Limit und Guthaben werden reserviert,
   das Produkt wird verbindlich zugeteilt und erst danach wird Geld belastet.
-- Die `... event`-Pfeile sind asynchrone Nachrichten über einen abstrakten
-  Event-Kanal. Jedes Event enthält mindestens `messageId`, `saleId`,
+- Die `... event`-Pfeile sind asynchrone Nachrichten über das Kafka-Topic
+  `sale-events`. Jedes Event enthält mindestens `messageId`, `saleId`,
   Ereignistyp, Version und Zeitstempel. Empfänger verarbeiten ein Event nur
   dann, wenn die Zustandsänderung für diese `saleId` noch gültig ist; Duplikate
   und verspätete Events bleiben damit wirkungslos.
@@ -593,13 +616,13 @@ sequenceDiagram
     participant AS as Account Service
 
     Kunde->>LS: startSale Command (saleId)
-    LS->>LS: Limit reservieren und LIMIT_RESERVED speichern
+    LS->>LS: Limit reservieren und LIMIT_RESERVED speichern (DB)
     LS-->>AS: LimitReserved event
-    AS->>AS: reserveFunds Fehler nach 10 ms speichern
+    AS->>AS: reserveFunds Fehler nach 10 ms speichern (DB)
     AS-->>LS: AccountReservationFailed event
-    LS->>LS: Limit freigeben und LIMIT_RELEASED speichern
+    LS->>LS: Limit freigeben und LIMIT_RELEASED speichern (DB)
     LS-->>Kunde: SaleFailed event
-    AS->>AS: ACCOUNT_RECONCILIATION_PENDING speichern
+    AS->>AS: ACCOUNT_RECONCILIATION_PENDING speichern (DB)
     Note right of AS: Account Service ist nicht erreichbar
     AS->>AS: Nach Recovery eigene Reservierung synchronisieren
     AS->>AS: Checkout Lease freigeben
@@ -642,14 +665,14 @@ sequenceDiagram
     Kunde->>LS: startSale Command (saleId)
     LS-->>AS: LimitReserved event
     AS-->>PS: FundsReserved event
-    PS->>PS: Bestand reservieren und STOCK_RESERVED speichern
+    PS->>PS: Bestand reservieren und STOCK_RESERVED speichern (DB)
     PS-->>AS: StockReserved event
-    AS->>AS: captureFunds Fehler nach 10 ms speichern
+    AS->>AS: captureFunds Fehler nach 10 ms speichern (DB)
     AS-->>PS: AccountCaptureFailed event
     AS-->>LS: AccountCaptureFailed event
-    PS->>PS: Bestand freigeben und STOCK_RELEASED speichern
-    LS->>LS: Limit freigeben und LIMIT_RELEASED speichern
-    AS->>AS: ACCOUNT_RECONCILIATION_PENDING speichern
+    PS->>PS: Bestand freigeben und STOCK_RELEASED speichern (DB)
+    LS->>LS: Limit freigeben und LIMIT_RELEASED speichern (DB)
+    AS->>AS: ACCOUNT_RECONCILIATION_PENDING speichern (DB)
     AS->>AS: Nach Recovery Guthaben freigeben oder erstatten
     AS->>AS: Checkout Lease freigeben
     LS-->>Kunde: SaleFailed event
@@ -692,7 +715,7 @@ sequenceDiagram
     AS-->>PS: FundsReserved event
     PS->>PS: reserveStock Verarbeitung Timeout
     PS->>PS: FundsReserved mit gleicher saleId erneut verarbeiten
-    PS->>PS: Bestand einmalig reservieren und STOCK_RESERVED speichern
+    PS->>PS: Bestand einmalig reservieren und STOCK_RESERVED speichern (DB)
     PS-->>AS: StockReserved event
     AS-->>LS: FundsCaptured event
     LS-->>PS: LimitConfirmed event
@@ -730,8 +753,8 @@ sequenceDiagram
     PS->>PS: Zweiter Verarbeitungsversuch schlaegt fehl
     PS-->>AS: ProductReservationFailed event
     PS-->>LS: ProductReservationFailed event
-    AS->>AS: Guthaben freigeben und FUNDS_RELEASED speichern
-    LS->>LS: Limit freigeben und LIMIT_RELEASED speichern
+    AS->>AS: Guthaben freigeben und FUNDS_RELEASED speichern (DB)
+    LS->>LS: Limit freigeben und LIMIT_RELEASED speichern (DB)
     AS-->>PS: FundsReleased event
     LS-->>PS: LimitReleased event
     PS->>PS: Eigene unklare Reservierung nach Recovery freigeben
@@ -769,11 +792,11 @@ sequenceDiagram
     participant PS as Produkt Service
 
     AS-->>LS: FundsCaptured event
-    LS->>LS: Limit abbuchen und LIMIT_CONFIRMED speichern
+    LS->>LS: Limit abbuchen und LIMIT_CONFIRMED speichern (DB)
     LS-->>PS: LimitConfirmed event
     PS->>PS: commitStock Verarbeitung Timeout
     PS->>PS: LimitConfirmed mit gleicher saleId erneut verarbeiten
-    PS->>PS: Bestand einmalig abbuchen und COMPLETED speichern
+    PS->>PS: Bestand einmalig abbuchen und COMPLETED speichern (DB)
 ```
 
 #### Entscheidung in 2b.1
@@ -807,17 +830,17 @@ sequenceDiagram
 
     LS-->>PS: LimitConfirmed event
     PS->>PS: Zweiter commitStock Versuch schlaegt fehl
-    PS->>PS: PRODUCT_COMMIT_RECONCILIATION_PENDING speichern
+    PS->>PS: PRODUCT_COMMIT_RECONCILIATION_PENDING speichern (DB)
     PS->>PS: Commit Status nach Recovery mit saleId aufloesen
     alt Bestand war bereits abgebucht
-        PS->>PS: Bestand freigeben und STOCK_RELEASED speichern
+        PS->>PS: Bestand freigeben und STOCK_RELEASED speichern (DB)
     else Bestand war nicht abgebucht
-        PS->>PS: Reservierung loeschen und STOCK_RELEASED speichern
+        PS->>PS: Reservierung loeschen und STOCK_RELEASED speichern (DB)
     end
     PS-->>AS: ProductCommitFailed event
     PS-->>LS: ProductCommitFailed event
-    AS->>AS: Guthaben erstatten und FUNDS_REFUNDED speichern
-    LS->>LS: Limit zurueckrollen und LIMIT_ROLLED_BACK speichern
+    AS->>AS: Guthaben erstatten und FUNDS_REFUNDED speichern (DB)
+    LS->>LS: Limit zurueckrollen und LIMIT_ROLLED_BACK speichern (DB)
     AS-->>PS: FundsRefunded event
     LS-->>PS: LimitRolledBack event
 ```
@@ -834,3 +857,99 @@ sequenceDiagram
   idempotent, sobald sein eigener Zustand wieder verfügbar ist. War der Bestand
   trotz Timeout bereits abgebucht, gibt Product Service ihn vor dem Abschluss
   der Kompensation wieder frei.
+
+# Recovery nach einem Absturz
+
+Die Aufgabenstellung verlangt, dass nach einem unerwarteten Ende des Systems
+alle Vorgänge aus dem persistierten Status rekonstruiert werden können und
+nicht abgeschlossene Verkäufe weder Limit noch Guthaben dauerhaft verbrauchen.
+
+## Orchestrierung: Recovery über `sale_saga`
+
+Beim Start und danach periodisch (z. B. alle 30 s) lädt ein Recovery-Job des
+Verkaufsservice alle Einträge aus `sale_saga`, deren Status weder `COMPLETED`
+noch `FAILED` ist. Weil der Verkaufsservice den Status erst **nach** der Antwort
+speichert, kann der zuletzt gesendete Aufruf beim Fachservice bereits
+angekommen sein. Deshalb wird dieser Aufruf nie „blind“ als gescheitert
+betrachtet, sondern idempotent mit derselben `saleId` wiederholt, kompensiert
+oder per Statusabfrage geklärt.
+
+| Gespeicherter Saga-Status | Was ist sicher bekannt? | Aktion nach Neustart |
+| --- | --- | --- |
+| `CHECKOUT_IN_PROGRESS` | nichts; `reserveLimit` evtl. angekommen | Abbruch: `releaseLimit(saleId)` → `RELEASED` oder `NOT_RESERVED`, dann `FAILED` |
+| `LIMIT_RESERVED` | Limit reserviert; `reserveFunds` evtl. angekommen | Abbruch: `releaseFunds`, `releaseLimit`, dann `FAILED` |
+| `FUNDS_RESERVED` | Limit und Guthaben reserviert; `reserveStock` evtl. angekommen | Abbruch: `releaseStock`, `releaseFunds`, `releaseLimit`, dann `FAILED` |
+| `STOCK_RESERVED` | alles reserviert; `captureFunds` evtl. angekommen | Statusabfrage `getFundsStatus(saleId)`: `CAPTURED` → vorwärts wie `FUNDS_CAPTURED`; sonst Abbruch wie oben |
+| `FUNDS_CAPTURED` | Geld ist belastet | vorwärts: `confirmLimit`, `commitStock` idempotent wiederholen |
+| `LIMIT_CONFIRMED` | Geld und Limit gebucht | vorwärts: `commitStock` idempotent wiederholen |
+| `COMPENSATING`, `*_PENDING` | Kompensation bzw. Klärung begonnen | dieselben idempotenten Kompensationen bzw. Statusabfragen erneut ausführen |
+
+Regel: **Vor** der Abbuchung des Geldes wird ein unterbrochener Verkauf
+abgebrochen und kompensiert; der Kunde hat zu diesem Zeitpunkt bereits eine
+Fehlermeldung oder ein Timeout erhalten. **Ab** `FUNDS_CAPTURED` wird nur noch
+vorwärts abgeschlossen. Alle Kompensationen sind idempotent; `NOT_RESERVED`
+ist eine gültige Antwort und bedeutet „es gab nichts freizugeben“.
+
+### Beispiel: Absturz des Verkaufsservice während `reserveStock`
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant VS as Verkaufsservice
+    participant LS as Limit Service
+    participant AS as Account Service
+    participant PS as Produkt Service
+
+    VS->>VS: Saga-Status FUNDS_RESERVED speichern (DB)
+    VS->>PS: reserveStock(saleId)
+    Note right of PS: STOCK_RESERVED speichern (DB)
+    Note over VS: Absturz, die Antwort RESERVED geht verloren
+    Note over VS: Neustart
+    VS->>VS: offene Sagas aus sale_saga laden (DB)
+    Note right of VS: saleId steht auf FUNDS_RESERVED,<br/>Ergebnis von reserveStock unbekannt
+    VS->>VS: Saga COMPENSATING speichern (DB)
+    VS->>PS: releaseStock(saleId)
+    PS-->>VS: RELEASED
+    VS->>AS: releaseFunds(saleId)
+    AS-->>VS: RELEASED
+    VS->>LS: releaseLimit(saleId)
+    LS-->>VS: RELEASED
+    VS->>VS: Saga FAILED speichern (DB) und Lease freigeben
+```
+
+Hätte `reserveStock` den Produkt Service nie erreicht, liefert
+`releaseStock(saleId)` `NOT_RESERVED`; der Ablauf bleibt identisch.
+
+### Absicherung gegen verwaiste Reservierungen
+
+Jede Reservierung in Limit, Account und Produkt Service hat ein
+`expires_at` (z. B. 15 Minuten). Ein Ablaufjob im jeweiligen Service fragt bei
+abgelaufenen Reservierungen `getSaleStatus(saleId)` beim Verkaufsservice ab:
+
+- `FAILED` oder Saga unbekannt → Reservierung freigeben (`EXPIRED` speichern (DB)).
+- `COMPLETED` oder Status ab `FUNDS_CAPTURED` → Reservierung bleiben lassen; die
+  endgültige Buchung folgt durch den Verkaufsservice.
+- Verkaufsservice nicht erreichbar → nicht freigeben, später erneut fragen.
+
+Damit wird keine Reservierung freigegeben, die nach der Abbuchung des Geldes
+noch gebraucht wird. Gleichzeitig bleibt keine Reservierung dauerhaft bestehen,
+weil der Recovery-Job jede offene Saga in einen Endzustand führt.
+
+## Choreographie: Recovery über Outbox, Topic und Offsets
+
+Es gibt keinen zentralen Saga-Status. Der Zustand eines Verkaufs ist auf die
+Tabellen der drei Services verteilt und vollständig im Kafka-Topic
+`sale-events` protokolliert (alle Events mit derselben `saleId`).
+
+| Absturz in … | Was ist persistiert? | Verhalten nach Neustart |
+| --- | --- | --- |
+| Verarbeitung eines eingehenden Events, vor dem DB-Commit | nichts (Transaktion zurückgerollt), Offset nicht committet | Kafka stellt das Event erneut zu; es wird normal verarbeitet |
+| nach dem DB-Commit, vor dem Offset-Commit | Status, Outbox-Eintrag und `messageId` in `processed_message` | Event wird erneut zugestellt, über `processed_message` als Duplikat erkannt und nur bestätigt |
+| nach dem DB-Commit, bevor das Relay die Outbox publiziert hat | Outbox-Eintrag mit Status `PENDING` | Relay publiziert alle offenen Outbox-Einträge erneut (at-least-once) |
+| Ausfall eines ganzen Services über längere Zeit | Events bleiben im Topic (Retention z. B. 7 Tage) | Service liest ab seinem letzten Offset weiter und setzt die Saga fort |
+
+Zur Rekonstruktion eines einzelnen Verkaufs genügt es, alle Events mit dessen
+`saleId` aus `sale-events` zu lesen oder die Reservierungstabellen der drei
+Services nach dieser `saleId` abzufragen. Weil jeder Service sein eingehendes
+Event erst nach dem eigenen DB-Commit bestätigt, geht weder ein Schritt noch
+eine Kompensation verloren.
