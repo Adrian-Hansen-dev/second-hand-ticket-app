@@ -190,12 +190,14 @@ technischer Fehler wird durch idempotente Wiederholung gelöst.
 Die Choreographie verwendet dieselbe Reihenfolge; dort markiert das Event
 `FundsCaptured` den Point of no Return.
 
+## Fehlerpfad 1a: Account Service lehnt die Guthabenreservierung ab
 
-## Fehlerpfad 1a: Account Service scheitert bei der Guthabenreservierung
-
-Der Account Service liefert nach 10 ms einen nicht wiederholbaren Fehler bei
-`reserveFunds`. Der ursprüngliche Aufruf wird nicht wiederholt, weil unklar ist,
-ob der Service die Reservierung kurz vor dem Fehler bereits gespeichert hat.
+Der Account Service liefert bei `reserveFunds` nach 10 ms einen Fehler, der
+kein Retry zulässt, z. B. `INSUFFICIENT_FUNDS` oder `ACCOUNT_LOCKED`. Anders als
+ein Timeout (Fehlerszenario 2) ist das ein **eindeutiges Ergebnis**: Der Account
+Service hat geantwortet, und er antwortet erst, nachdem seine lokale
+Transaktion zurückgerollt und die Ablehnung zur `saleId` gespeichert ist. Es
+existiert also keine Geldreservierung, die kompensiert werden müsste.
 
 ### Komponentendiagramm
 
@@ -206,55 +208,55 @@ flowchart LR
     AS[Account Service]
 
     VS -->|1. Limit reservieren| LS
-    VS -->|2. Guthaben reservieren Fehler| AS
+    VS -->|2. Guthaben reservieren abgelehnt| AS
     VS -->|3. Limit freigeben| LS
-    VS -->|4. Kompensation synchronisieren nach Recovery| AS
 ```
 
 ```mermaid
 sequenceDiagram
     autonumber
+    actor Kunde
     participant VS as Verkaufsservice
     participant LS as Limit Service
     participant AS as Account Service
-    participant PS as Produkt Service
 
+    Kunde->>VS: POST /verkaeufe (saleId, ...)
+    VS->>VS: CHECKOUT_IN_PROGRESS und Lease speichern (DB)
     VS->>LS: reserveLimit(saleId)
     LS-->>VS: RESERVED
     VS->>VS: Saga LIMIT_RESERVED speichern (DB)
 
     VS->>AS: reserveFunds(saleId)
-    AS-->>VS: ERROR nach 10 ms ohne Retry
+    Note right of AS: Bedingung nicht erfüllt, Transaktion zurückrollen,<br/>FUNDS_REJECTED speichern (DB)
+    AS-->>VS: REJECTED nach 10 ms (nicht wiederholbar)
     VS->>VS: Saga COMPENSATING speichern (DB)
     VS->>LS: releaseLimit(saleId)
+    Note right of LS: reserved verringern,<br/>LIMIT_RELEASED speichern (DB)
     LS-->>VS: RELEASED
-    VS->>VS: Limit kompensiert speichern (DB)
-    VS->>VS: ACCOUNT_RECONCILIATION_PENDING speichern (DB)
-    Note right of AS: Service ist nicht erreichbar
-    VS->>AS: healthCheck bis Service wieder verfuegbar ist
-    AS-->>VS: AVAILABLE
-    VS->>AS: synchronizeCompensation(saleId)
-    AS-->>VS: RELEASED oder NOT_RESERVED
-    Note right of AS: Status FUNDS_RELEASED oder NOT_RESERVED speichern (DB)
     VS->>VS: Saga FAILED speichern (DB) und Lease freigeben
+    VS-->>Kunde: Kauf abgelehnt (z. B. Guthaben reicht nicht)
 ```
 
 ### Entscheidungen in Fehlerpfad 1a
 
-- Die Limitreservierung wird sofort freigegeben, weil ihr Erfolg sicher bekannt
-  ist.
-- `reserveFunds` wird nicht wiederholt. Stattdessen wird
-  `ACCOUNT_RECONCILIATION_PENDING` gespeichert, damit die Kompensation nicht bei
-  einem Absturz verloren geht.
-- Erst wenn Account Service wieder verfügbar ist, synchronisiert
-  `synchronizeCompensation(saleId)` die möglicherweise entstandene Reservierung
-  zu `FUNDS_RELEASED` oder `NOT_RESERVED`.
+- **Kein Retry, keine Statusabfrage:** Der Fehler ist fachlich und endgültig.
+  Ein erneuter Aufruf würde dasselbe Ergebnis liefern.
+- **Nur das Limit wird kompensiert.** Beim Account Service gibt es nichts
+  freizugeben, und der Produkt Service wurde noch gar nicht aufgerufen.
+- Die Ablehnung wird beim Account Service zur `saleId` gespeichert. Sendet der
+  Verkaufsservice nach einem eigenen Absturz `reserveFunds(saleId)` erneut,
+  erhält er wieder `REJECTED` statt einer neuen Reservierung (Idempotenz).
+- Nach der Freigabe ist der Tagesbetrag des Kunden wieder vollständig
+  verfügbar; der gescheiterte Kauf verbraucht weder Limit noch Guthaben.
 
-## Fehlerpfad 1b: Account Service scheitert beim Abbuchen
+## Fehlerpfad 1b: Account Service lehnt die Abbuchung ab
 
-Hier waren Limit, Guthaben und Produkt bereits reserviert. Der Fehler bei
-`captureFunds` bedeutet deshalb, dass alle drei Reservierungen kompensiert werden
-müssen.
+Limit, Guthaben und Produkt sind reserviert. `captureFunds` wird nach 10 ms mit
+einem nicht wiederholbaren Fehler abgelehnt, z. B. weil das Konto in der
+Zwischenzeit wegen Betrugsverdacht gesperrt wurde. Weil die Abbuchung selbst
+der Point of no Return ist und **nicht** gelungen ist, wird der Kauf vollständig
+zurückgerollt. Die Geldreservierung besteht beim Account Service noch und wird
+mit freigegeben.
 
 ### Komponentendiagramm
 
@@ -268,15 +270,16 @@ flowchart LR
     VS -->|1. Limit reservieren| LS
     VS -->|2. Guthaben reservieren| AS
     VS -->|3. Produkt reservieren| PS
-    VS -->|4. Konto belasten Fehler| AS
+    VS -->|4. Konto belasten abgelehnt| AS
     VS -->|5. Produkt freigeben| PS
-    VS -->|6. Limit freigeben| LS
-    VS -->|7. Kompensation synchronisieren nach Recovery| AS
+    VS -->|6. Guthaben freigeben| AS
+    VS -->|7. Limit freigeben| LS
 ```
 
 ```mermaid
 sequenceDiagram
     autonumber
+    actor Kunde
     participant VS as Verkaufsservice
     participant LS as Limit Service
     participant AS as Account Service
@@ -293,33 +296,31 @@ sequenceDiagram
     VS->>VS: Saga STOCK_RESERVED speichern (DB)
 
     VS->>AS: captureFunds(saleId)
-    AS-->>VS: ERROR nach 10 ms ohne Retry
+    Note right of AS: Abbuchung abgelehnt, Transaktion zurückrollen,<br/>CAPTURE_REJECTED speichern (DB)
+    AS-->>VS: REJECTED nach 10 ms (nicht wiederholbar)
     VS->>VS: Saga COMPENSATING speichern (DB)
     VS->>PS: releaseStock(saleId)
     PS-->>VS: RELEASED
+    VS->>AS: releaseFunds(saleId)
+    AS-->>VS: RELEASED
     VS->>LS: releaseLimit(saleId)
     LS-->>VS: RELEASED
-    VS->>VS: ACCOUNT_RECONCILIATION_PENDING speichern (DB)
-    Note right of AS: Service ist nicht erreichbar
-    VS->>AS: healthCheck bis Service wieder verfuegbar ist
-    AS-->>VS: AVAILABLE
-    VS->>AS: synchronizeCompensation(saleId)
-    AS-->>VS: RELEASED oder REFUNDED
-    Note right of AS: Status FUNDS_RELEASED oder FUNDS_REFUNDED speichern (DB)
     VS->>VS: Saga FAILED speichern (DB) und Lease freigeben
+    VS-->>Kunde: Kauf abgelehnt
 ```
 
 ### Entscheidungen in Fehlerpfad 1b
 
-- Produkt und Limit werden sofort freigegeben, weil beide Services erreichbar
-  sind und ihre Reservierungen sicher bekannt sind.
-- Für Account wird `ACCOUNT_RECONCILIATION_PENDING` gespeichert. So lange der
-  Service down ist, bleibt die Kompensation bestehen und der ursprüngliche
-  Abbuchungsaufruf wird nicht wiederholt.
-- Nach Recovery führt `synchronizeCompensation(saleId)` zu `FUNDS_RELEASED`.
-  Falls die Belastung vor dem Fehler schon erfolgt war, wird stattdessen
-  `FUNDS_REFUNDED` gespeichert. Erst danach wird die Saga endgültig als
-  `FAILED` abgeschlossen und die Lease freigegeben.
+- Die Ablehnung ist eindeutig: Es wurde kein Geld abgebucht. Damit ist der
+  Point of no Return nicht überschritten, und alle drei Reservierungen werden
+  in umgekehrter Reihenfolge freigegeben.
+- Der Produkt Service wird zuerst freigegeben, damit der umkämpfte Bestand
+  sofort wieder für andere Kunden verfügbar ist.
+- `releaseFunds` ist trotz der abgelehnten Abbuchung möglich: Eine Freigabe
+  verringert nur `reserved` und ist auch für ein gesperrtes Konto erlaubt.
+- Jede Kompensation ist mit der `saleId` idempotent. Stürzt der
+  Verkaufsservice während der Kompensation ab, setzt der Recovery-Job im Status
+  `COMPENSATING` dort fort (siehe [Recovery](#recovery-nach-einem-absturz)).
 
 ## Fehlerpfad 2a: Timeout bei der Produktreservierung
 
@@ -438,8 +439,9 @@ sequenceDiagram
   die idempotente Freigabe bestätigt. `releaseStock(saleId)` löst dann eine
   möglicherweise durch einen der beiden Aufrufe entstandene Produktreservierung
   auf.
-- Das entspricht dem Kompensationsmuster aus Fehlerpfad 1: Der fehlgeschlagene
-  Kauf wird nicht fortgesetzt, aber jede unbekannte Teilwirkung wird später
+- Anders als in Fehlerpfad 1 ist das Ergebnis hier nach dem Timeout unbekannt.
+  Deshalb wird nicht nur kompensiert, was sicher reserviert ist, sondern auch
+  die möglicherweise entstandene Teilwirkung beim Produkt Service später
   idempotent bereinigt.
 
 ## Fehlerpfad 2b: Timeout beim endgültigen Abbuchen des Bestands
@@ -649,7 +651,7 @@ sequenceDiagram
   dann, wenn die Zustandsänderung für diese `saleId` noch gültig ist; Duplikate
   und verspätete Events bleiben damit wirkungslos.
 
-## Fehlerpfad 1a: Account Service scheitert bei der Guthabenreservierung
+## Fehlerpfad 1a: Account Service lehnt die Guthabenreservierung ab
 
 ### Komponentendiagramm
 
@@ -659,7 +661,7 @@ flowchart LR
     AS[Account Service]
 
     LS -->|1. LimitReserved event| AS
-    AS -->|2. AccountReservationFailed event| LS
+    AS -->|2. FundsRejected event| LS
 ```
 
 ```mermaid
@@ -672,26 +674,24 @@ sequenceDiagram
     Kunde->>LS: startSale Command (saleId)
     LS->>LS: Limit reservieren und LIMIT_RESERVED speichern (DB)
     LS-->>AS: LimitReserved event
-    AS->>AS: reserveFunds Fehler nach 10 ms speichern (DB)
-    AS-->>LS: AccountReservationFailed event
+    AS->>AS: reserveFunds nach 10 ms abgelehnt, Transaktion zurückrollen
+    AS->>AS: FUNDS_REJECTED und Outbox-Event speichern (DB)
+    AS-->>LS: FundsRejected event
     LS->>LS: Limit freigeben und LIMIT_RELEASED speichern (DB)
-    LS-->>Kunde: SaleFailed event
-    AS->>AS: ACCOUNT_RECONCILIATION_PENDING speichern (DB)
-    Note right of AS: Account Service ist nicht erreichbar
-    AS->>AS: Nach Recovery eigene Reservierung synchronisieren
-    AS->>AS: Checkout Lease freigeben
+    LS-->>Kunde: SaleFailed Benachrichtigung
 ```
 
 ### Entscheidungen in Fehlerpfad 1a
 
-- Account Service publiziert das Fehlerereignis; Limit Service reagiert selbst
+- Die Ablehnung ist eindeutig; es entsteht keine Geldreservierung, und der
+  Account Service muss nichts nachträglich bereinigen.
+- Account Service publiziert `FundsRejected`; Limit Service reagiert selbst
   darauf und gibt seine Reservierung frei. Es gibt keinen zentralen
   Kompensationsaufruf.
-- Account Service hält seine Kompensationsaufgabe dauerhaft. Nach Recovery löst
-  er eine eventuell entstandene Reservierung mit derselben `saleId` auf und
-  publiziert erst dann `AccountReconciled`.
+- Wird `LimitReserved` erneut zugestellt, erkennt der Account Service die
+  `saleId` als bereits abgelehnt und publiziert nur erneut `FundsRejected`.
 
-## Fehlerpfad 1b: Account Service scheitert beim Abbuchen
+## Fehlerpfad 1b: Account Service lehnt die Abbuchung ab
 
 ### Komponentendiagramm
 
@@ -704,8 +704,8 @@ flowchart LR
     LS -->|1. LimitReserved event| AS
     AS -->|2. FundsReserved event| PS
     PS -->|3. StockReserved event| AS
-    AS -->|4. AccountCaptureFailed event| PS
-    AS -->|5. AccountCaptureFailed event| LS
+    AS -->|4. FundsCaptureFailed event| PS
+    AS -->|5. FundsCaptureFailed event| LS
 ```
 
 ```mermaid
@@ -717,28 +717,29 @@ sequenceDiagram
     participant PS as Produkt Service
 
     Kunde->>LS: startSale Command (saleId)
+    LS->>LS: Limit reservieren und LIMIT_RESERVED speichern (DB)
     LS-->>AS: LimitReserved event
+    AS->>AS: Guthaben reservieren und FUNDS_RESERVED speichern (DB)
     AS-->>PS: FundsReserved event
     PS->>PS: Bestand reservieren und STOCK_RESERVED speichern (DB)
     PS-->>AS: StockReserved event
-    AS->>AS: captureFunds Fehler nach 10 ms speichern (DB)
-    AS-->>PS: AccountCaptureFailed event
-    AS-->>LS: AccountCaptureFailed event
+    AS->>AS: captureFunds nach 10 ms abgelehnt
+    AS->>AS: eigene Reservierung freigeben und FUNDS_RELEASED speichern (DB)
+    AS-->>PS: FundsCaptureFailed event
+    AS-->>LS: FundsCaptureFailed event
     PS->>PS: Bestand freigeben und STOCK_RELEASED speichern (DB)
     LS->>LS: Limit freigeben und LIMIT_RELEASED speichern (DB)
-    AS->>AS: ACCOUNT_RECONCILIATION_PENDING speichern (DB)
-    AS->>AS: Nach Recovery Guthaben freigeben oder erstatten
-    AS->>AS: Checkout Lease freigeben
-    LS-->>Kunde: SaleFailed event
+    LS-->>Kunde: SaleFailed Benachrichtigung
 ```
 
 ### Entscheidungen in Fehlerpfad 1b
 
-- Das Fehlerereignis wird an alle betroffenen Services publiziert. Produkt und
-  Limit kompensieren sich unabhängig und parallel.
-- Account Service klärt seine unbekannte Teilwirkung nach Recovery selbst. Je
-  nach Zustand wird Guthaben freigegeben oder eine bereits erfolgte Belastung
-  erstattet.
+- Die Abbuchung ist eindeutig gescheitert, `FundsCaptured` wurde nie
+  publiziert. Der Point of no Return ist also nicht überschritten.
+- Account Service gibt seine eigene Reservierung in derselben lokalen
+  Transaktion frei, in der er das Fehlerereignis in die Outbox schreibt.
+- Produkt und Limit Service konsumieren `FundsCaptureFailed` aus demselben
+  Topic und kompensieren unabhängig und parallel.
 
 ## Fehlerpfad 2a: Timeout bei der Produktreservierung
 
