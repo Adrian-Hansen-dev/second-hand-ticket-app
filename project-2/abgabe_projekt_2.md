@@ -1,3 +1,75 @@
+# Projekt 2: Distributed Consensus – Verkauf im Fliesen-Onlineportal
+
+**Gruppe:** Hansen, Asanov, Holzner, Misic
+**Abgabe:** 3.11.2026
+
+## Aufgabe
+
+Kunden kaufen auf einem Online-Portal Fliesen und bezahlen mit Guthaben von
+einem portalverwalteten Konto. Je Kunde dürfen höchstens **200 € pro Tag**
+ausgegeben werden. Drei Services müssen sich bei jedem Verkauf einig sein:
+
+- **Limit Service:** autorisiert den Betrag gegen das Tageslimit
+  (sicherheitsrelevant, Angriffe über parallele Anfragen bekannt).
+- **Account Service:** belastet nur vorhandenes Guthaben, kein Überziehen.
+- **Produkt Service:** verkauft nur vorhandenen Bestand, beliebte Produkte
+  werden gleichzeitig von vielen Kunden gekauft.
+
+Ausgearbeitet werden der Gutfall und zwei Fehlerszenarien, jeweils mit
+**Orchestrierung** (über einen eigenen Verkaufsservice) und mit
+**Choreographie** (über Events):
+
+1. Der Account Service liefert nach 10 ms einen Fehler, der kein Retry zulässt.
+2. Zugriffe auf den Produkt Service laufen in ein Timeout.
+
+## Lösung in Kürze
+
+- **Saga statt verteilter Transaktion:** Jeder Service ändert nur seine eigene
+  Datenbank in lokalen Transaktionen. Bei einem Fehler wird kompensiert.
+- **Zwei Phasen:** Zuerst werden Limit, Guthaben und Bestand **reserviert**.
+  Erst wenn alle drei Reservierungen bestehen, wird gebucht. Die Abbuchung des
+  Geldes (`captureFunds` / `FundsCaptured`) ist der **Point of no Return**:
+  davor wird zurückgerollt, danach nur noch vorwärts abgeschlossen.
+- **Idempotenz:** Jeder Aufruf und jedes Event trägt die `saleId`. Wiederholungen
+  nach Timeout oder Absturz haben keine doppelte Wirkung; unbekannte Ergebnisse
+  werden per Statusabfrage geklärt.
+- **Persistenz:** Jeder Service speichert seinen Status in der eigenen DB, bevor
+  er antwortet. Events laufen über eine Transactional Outbox in das
+  Kafka-Topic `sale-events`.
+- **Nebenläufigkeit:** Limit über ein Zeilen-Lock (`SELECT … FOR UPDATE`),
+  Guthaben und Bestand über ein bedingtes atomares `UPDATE`.
+
+## Übersicht der Illustrationen
+
+Die sechs geforderten Illustrationen sind je ein Szenario pro Variante. Jedes
+Szenario besteht aus einem Komponentendiagramm (Überblick mit nummerierten
+Schritten) und einem Sequenzdiagramm (genauer Ablauf mit Persistenz). Die
+Fehlerszenarien sind in Unterfälle aufgeteilt, weil der Fehler an
+verschiedenen Stellen der Saga auftreten kann.
+
+| Nr. | Szenario | Orchestrierung | Choreographie |
+| --- | --- | --- | --- |
+| 1 / 4 | Gutfall | [Happy Path](#ablauf-eines-erfolgreichen-verkaufs) | [Happy Path](#ablauf-eines-erfolgreichen-verkaufs-1) |
+| 2 / 5 | Fehlerszenario 1: Account Service, Fehler ohne Retry | [1a: bei der Reservierung](#fehlerpfad-1a-account-service-lehnt-die-guthabenreservierung-ab), [1b: bei der Abbuchung](#fehlerpfad-1b-account-service-lehnt-die-abbuchung-ab) | [1a](#fehlerpfad-1a-account-service-lehnt-die-guthabenreservierung-ab-1), [1b](#fehlerpfad-1b-account-service-lehnt-die-abbuchung-ab-1) |
+| 3 / 6 | Fehlerszenario 2: Timeout beim Produkt Service | [2a: bei der Reservierung](#fehlerpfad-2a-timeout-bei-der-produktreservierung) (2a.1 Retry erfolgreich, 2a.2 Abbruch), [2b: bei der Abbuchung](#fehlerpfad-2b-timeout-beim-endgültigen-abbuchen-des-bestands) (2b.1, 2b.2) | [2a](#fehlerpfad-2a-timeout-bei-der-produktreservierung-1), [2b](#fehlerpfad-2b-timeout-beim-endgültigen-abbuchen-des-bestands-1) |
+
+Ergänzend:
+[Reihenfolge und Point of no Return](#reihenfolge-der-schritte-und-point-of-no-return),
+[Recovery nach einem Absturz](#recovery-nach-einem-absturz),
+[Nebenläufigkeit](#nebenläufigkeit) und
+[Vergleich der beiden Varianten](#vergleich-orchestrierung-und-choreographie).
+
+## Notation
+
+| Element | Bedeutung |
+| --- | --- |
+| `A->>B: aufruf(saleId)` | synchroner Aufruf (Orchestrierung) bzw. interner Verarbeitungsschritt, wenn `A = B` |
+| `B-->>A: RESULTAT` | Antwort auf einen synchronen Aufruf |
+| `A-->>B: Xyz event` | asynchrones Event über Outbox und Kafka-Topic `sale-events` (Choreographie) |
+| `… speichern (DB)` | Status wird in einer lokalen Transaktion in der Datenbank des Services persistiert |
+| `TIMEOUT` | keine Antwort innerhalb der Frist, Ergebnis **unbekannt** |
+| `REJECTED` | eindeutige fachliche Ablehnung, Ergebnis **bekannt** |
+
 # Orchestrierung: Verkaufsvorgang
 
 Der **Verkaufsservice** ist der Orchestrator der Saga. Er steuert die Reihenfolge
@@ -118,7 +190,7 @@ sequenceDiagram
     VS->>PS: commitStock(saleId)
     PS-->>VS: CONFIRMED
     VS->>VS: Saga-Status COMPLETED speichern (DB) und Lease freigeben
-    VS-->>Kunde: Verkauf bestaetigt
+    VS-->>Kunde: Verkauf bestätigt
 
     Note over VS,PS: Recovery nutzt die gespeicherten Saga und Service Status
 ```
@@ -1163,3 +1235,24 @@ abgelehnt, und ihre Saga kompensiert Limit und Guthaben wie in den Fehlerpfaden.
   Account und Produkt genügt das bedingte `UPDATE`, das intern dieselbe
   Zeilensperre nutzt, aber ohne zusätzlichen Lese-Roundtrip auskommt. Das ist
   vor allem beim stark umkämpften Bestand beliebter Produkte wichtig.
+
+# Vergleich: Orchestrierung und Choreographie
+
+| Kriterium | Orchestrierung (Verkaufsservice) | Choreographie (Events) |
+| --- | --- | --- |
+| Wer kennt den Gesamtzustand? | Verkaufsservice in `sale_saga` | niemand allein; verteilt auf drei Services und das Topic |
+| Reihenfolge und Point of no Return | an einer Stelle definiert und geändert | in den Event-Abhängigkeiten der Services verteilt |
+| Timeout-Erkennung | Aufruf-Timeout im Verkaufsservice | Frist beim wartenden Service (`stock_deadline`) |
+| Recovery | Recovery-Job liest offene Sagas | Outbox, Offsets und Deadline-Jobs je Service |
+| Kopplung | Fachservices kennen nur ihre eigene API | jeder Service kennt die Events seiner Nachbarn |
+| Zusätzliche Komponente | Verkaufsservice mit eigener DB | keine, aber Kafka als Infrastruktur |
+| Nachvollziehbarkeit eines Verkaufs | ein Datensatz in `sale_saga` | Events mit gleicher `saleId` im Topic zusammensuchen |
+
+**Empfehlung:** Für diesen Anwendungsfall bevorzugen wir die **Orchestrierung**.
+Das Tageslimit ist eine rechtliche Vorgabe, und der Limit Service ist
+sicherheitsrelevant. Ein zentraler Verkaufsservice macht Reihenfolge, Point of
+no Return und den Zustand jedes Verkaufs an einer Stelle prüfbar. Die
+Choreographie spart den zusätzlichen Service, verteilt diese Logik aber auf
+drei Teams und macht Fehleranalyse und spätere Änderungen der Reihenfolge
+aufwändiger. Die Sicherheit des Limits hängt in beiden Varianten nicht vom
+Ablauf ab, sondern von der atomaren Reservierung im Limit Service.
